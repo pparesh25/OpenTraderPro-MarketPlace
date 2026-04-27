@@ -1,0 +1,35 @@
+"""Aroon indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class Aroon(BaseIndicator):
+    """Aroon — identifies trend changes and strength."""
+
+    name = "Aroon"
+    short_name = "Aroon"
+    description = "Aroon Up/Down for trend identification."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 25}
+        self.add_line("aroon_up", "Aroon Up", color="#4CAF50")
+        self.add_line("aroon_down", "Aroon Down", color="#FF5252")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+        period = self.parameters["period"]
+
+        aroon_down, aroon_up = talib.AROON(high, low, timeperiod=period)
+
+        self.lines["aroon_up"].data = aroon_up
+        self.lines["aroon_down"].data = aroon_down
+
+    def get_value_range(self):
+        return (-5, 105)

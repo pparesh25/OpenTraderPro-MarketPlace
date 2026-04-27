@@ -1,0 +1,36 @@
+"""Keltner Channels indicator."""
+
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class KeltnerChannels(BaseIndicator):
+    """Keltner Channels — EMA ± ATR multiplier."""
+
+    name = "Keltner Channels"
+    short_name = "KC"
+    description = "Volatility channels using EMA and ATR."
+    overlay_on_price = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 20, "multiplier": 1.5}
+        self.add_line("upper", "Upper", color="#4CAF50")
+        self.add_line("middle", "Middle", color="#B2B5BE")
+        self.add_line("lower", "Lower", color="#FF5252")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        mult = self.parameters["multiplier"]
+        close = self._col(df, "close")
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+
+        middle = talib.EMA(close, timeperiod=period)
+        atr = talib.ATR(high, low, close, timeperiod=period)
+        
+        self.lines["upper"].data = middle + mult * atr
+        self.lines["middle"].data = middle
+        self.lines["lower"].data = middle - mult * atr

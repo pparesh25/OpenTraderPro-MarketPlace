@@ -1,0 +1,38 @@
+"""Williams %R indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class WilliamsR(BaseIndicator):
+    """Williams %R — momentum oscillator (-100 to 0)."""
+
+    name = "Williams %R"
+    short_name = "W%R"
+    description = "Williams Percent Range oscillator."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 14, "overbought": -20, "oversold": -80}
+        self.add_line("williams_r", "Williams %R", color="#2962FF")
+        self.add_line("overbought", "Overbought", color="#FF5252", style="dash")
+        self.add_line("oversold", "Oversold", color="#4CAF50", style="dash")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+        close = self._col(df, "close")
+
+        self.lines["williams_r"].data = talib.WILLR(high, low, close, timeperiod=period)
+        
+        n = len(df)
+        self.lines["overbought"].data = np.full(n, self.parameters["overbought"])
+        self.lines["oversold"].data = np.full(n, self.parameters["oversold"])
+
+    def get_value_range(self):
+        return (-105, 5)

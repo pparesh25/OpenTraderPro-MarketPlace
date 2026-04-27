@@ -1,0 +1,37 @@
+"""Bollinger Bands indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class BollingerBands(BaseIndicator):
+    """Bollinger Bands — SMA ± standard deviations."""
+
+    name = "Bollinger Bands"
+    short_name = "BB"
+    description = "Volatility bands above and below a moving average."
+    overlay_on_price = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 20, "deviations": 2.0}
+        self.add_line("upper", "Upper Band", color="#4CAF50")
+        self.add_line("middle", "Middle Band", color="#B2B5BE")
+        self.add_line("lower", "Lower Band", color="#FF5252")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        dev = self.parameters["deviations"]
+        close = self._col(df, "close")
+
+        # TA-Lib returns (upper, middle, lower)
+        upper, middle, lower = talib.BBANDS(
+            close, timeperiod=period, nbdevup=dev, nbdevdn=dev, matype=0
+        )
+        
+        self.lines["upper"].data = upper
+        self.lines["middle"].data = middle
+        self.lines["lower"].data = lower

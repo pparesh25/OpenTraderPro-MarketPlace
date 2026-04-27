@@ -1,0 +1,51 @@
+"""Stochastic Oscillator indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class Stochastic(BaseIndicator):
+    """Stochastic Oscillator — %K and %D momentum."""
+
+    name = "Stochastic"
+    short_name = "Stoch"
+    description = "Stochastic Oscillator comparing close to high-low range."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"k_period": 14, "slow_k_period": 3, "d_period": 3, "overbought": 80, "oversold": 20}
+        self.add_line("k", "%K", color="#2962FF")
+        self.add_line("d", "%D", color="#FF9800")
+        self.add_line("overbought", "Overbought", color="#FF5252", style="dash")
+        self.add_line("oversold", "Oversold", color="#4CAF50", style="dash")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        k_period = self.parameters["k_period"]
+        slow_k_period = self.parameters["slow_k_period"]
+        d_period = self.parameters["d_period"]
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+        close = self._col(df, "close")
+
+        # Standard Stochastic (Slow)
+        # fastk_period, slowk_period, slowk_matype, slowd_period, slowd_matype
+        slowk, slowd = talib.STOCH(
+            high, low, close, 
+            fastk_period=k_period, 
+            slowk_period=slow_k_period, slowk_matype=0, 
+            slowd_period=d_period, slowd_matype=0
+        )
+        
+        self.lines["k"].data = slowk
+        self.lines["d"].data = slowd
+        
+        n = len(df)
+        self.lines["overbought"].data = np.full(n, self.parameters["overbought"])
+        self.lines["oversold"].data = np.full(n, self.parameters["oversold"])
+
+    def get_value_range(self):
+        return (-5, 105)

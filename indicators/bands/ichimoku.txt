@@ -1,0 +1,52 @@
+"""Ichimoku Cloud indicator."""
+
+import numpy as np
+import pandas as pd
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class Ichimoku(BaseIndicator):
+    """Ichimoku Cloud — trend direction, support/resistance."""
+
+    name = "Ichimoku Cloud"
+    short_name = "Ichimoku"
+    description = "Japanese charting method for trend analysis."
+    overlay_on_price = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {
+            "tenkan_period": 9,
+            "kijun_period": 26,
+            "senkou_b_period": 52,
+        }
+        self.add_line("tenkan", "Tenkan-sen", color="#2962FF")
+        self.add_line("kijun", "Kijun-sen", color="#FF5252")
+        self.add_line("senkou_a", "Senkou Span A", color="#4CAF50")
+        self.add_line("senkou_b", "Senkou Span B", color="#FF9800")
+        self.add_line("chikou", "Chikou Span", color="#9C27B0")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+        close = self._col(df, "close")
+
+        tp = self.parameters["tenkan_period"]
+        kp = self.parameters["kijun_period"]
+        sp = self.parameters["senkou_b_period"]
+
+        s_high = pd.Series(high)
+        s_low = pd.Series(low)
+
+        # Vectorized midpoint: (rolling_max + rolling_min) / 2
+        tenkan = ((s_high.rolling(tp).max() + s_low.rolling(tp).min()) / 2).values.astype(np.float64)
+        kijun = ((s_high.rolling(kp).max() + s_low.rolling(kp).min()) / 2).values.astype(np.float64)
+        senkou_b = ((s_high.rolling(sp).max() + s_low.rolling(sp).min()) / 2).values.astype(np.float64)
+        senkou_a = ((tenkan + kijun) / 2)
+
+        self.lines["tenkan"].data = tenkan
+        self.lines["kijun"].data = kijun
+        self.lines["senkou_a"].data = senkou_a
+        self.lines["senkou_b"].data = senkou_b
+        self.lines["chikou"].data = close

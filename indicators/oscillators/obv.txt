@@ -1,0 +1,26 @@
+"""On-Balance Volume indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class OBV(BaseIndicator):
+    """OBV — cumulative volume based on price direction."""
+
+    name = "OBV"
+    short_name = "OBV"
+    description = "On-Balance Volume — cumulative volume flow."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {}
+        self.add_line("obv", "OBV", color="#2962FF")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        close = self._col(df, "close")
+        volume = self._col(df, "volume")
+        self.lines["obv"].data = talib.OBV(close, volume)

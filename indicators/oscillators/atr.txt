@@ -1,0 +1,29 @@
+"""Average True Range indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class ATR(BaseIndicator):
+    """ATR — measures volatility using true range."""
+
+    name = "ATR"
+    short_name = "ATR"
+    description = "Average True Range for volatility measurement."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 14}
+        self.add_line("atr", "ATR", color="#2962FF")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+        close = self._col(df, "close")
+
+        self.lines["atr"].data = talib.ATR(high, low, close, timeperiod=period)

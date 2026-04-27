@@ -1,0 +1,45 @@
+"""MACD indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class MACD(BaseIndicator):
+    """MACD — trend-following momentum oscillator."""
+
+    name = "MACD"
+    short_name = "MACD"
+    description = "Moving Average Convergence/Divergence."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {
+            "fast_period": 12,
+            "slow_period": 26,
+            "signal_period": 9,
+        }
+        self.add_line("macd", "MACD Line", color="#2962FF")
+        self.add_line("signal", "Signal Line", color="#FF9800")
+        self.add_line("histogram", "Histogram", color="#4CAF50", style="histogram")
+        self.add_line("zero_line", "Zero Line", color="#9E9E9E")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        fast = self.parameters["fast_period"]
+        slow = self.parameters["slow_period"]
+        signal = self.parameters["signal_period"]
+        close = self._col(df, "close")
+
+        macd, macdsignal, macdhist = talib.MACD(
+            close, fastperiod=fast, slowperiod=slow, signalperiod=signal
+        )
+        
+        self.lines["macd"].data = macd
+        self.lines["signal"].data = macdsignal
+        self.lines["histogram"].data = macdhist
+        
+        n = len(df)
+        self.lines["zero_line"].data = np.zeros(n)

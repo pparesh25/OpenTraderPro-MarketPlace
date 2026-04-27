@@ -1,0 +1,25 @@
+"""Double Exponential Moving Average indicator."""
+
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class DEMA(BaseIndicator):
+    """Double Exponential Moving Average."""
+
+    name = "Double Exponential Moving Average"
+    short_name = "DEMA"
+    description = "Less lag than standard EMA by using double smoothing."
+    overlay_on_price = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 20}
+        self.add_line("dema", "DEMA", color="#FF9800")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        close = self._col(df, "close")
+        self.lines["dema"].data = talib.DEMA(close, timeperiod=period)

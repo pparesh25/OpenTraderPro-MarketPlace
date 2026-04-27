@@ -1,0 +1,37 @@
+"""Average Directional Index indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class ADX(BaseIndicator):
+    """ADX — measures trend strength (not direction)."""
+
+    name = "ADX"
+    short_name = "ADX"
+    description = "Average Directional Index for trend strength."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 14}
+        self.add_line("adx", "ADX", color="#2962FF")
+        self.add_line("plus_di", "+DI", color="#4CAF50")
+        self.add_line("minus_di", "-DI", color="#FF5252")
+        self.add_line("level", "Level", color="#9E9E9E", style="dash")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+        close = self._col(df, "close")
+
+        self.lines["adx"].data = talib.ADX(high, low, close, timeperiod=period)
+        self.lines["plus_di"].data = talib.PLUS_DI(high, low, close, timeperiod=period)
+        self.lines["minus_di"].data = talib.MINUS_DI(high, low, close, timeperiod=period)
+        
+        n = len(df)
+        self.lines["level"].data = np.full(n, 20.0)

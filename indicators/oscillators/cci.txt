@@ -1,0 +1,35 @@
+"""Commodity Channel Index indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class CCI(BaseIndicator):
+    """CCI — measures deviation from statistical mean."""
+
+    name = "CCI"
+    short_name = "CCI"
+    description = "Commodity Channel Index measuring price deviation."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 20, "overbought": 100, "oversold": -100}
+        self.add_line("cci", "CCI", color="#2962FF")
+        self.add_line("overbought", "Overbought", color="#FF5252", style="dash")
+        self.add_line("oversold", "Oversold", color="#4CAF50", style="dash")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        high = self._col(df, "high")
+        low = self._col(df, "low")
+        close = self._col(df, "close")
+
+        self.lines["cci"].data = talib.CCI(high, low, close, timeperiod=period)
+        
+        n = len(df)
+        self.lines["overbought"].data = np.full(n, self.parameters["overbought"])
+        self.lines["oversold"].data = np.full(n, self.parameters["oversold"])

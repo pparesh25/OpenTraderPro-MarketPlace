@@ -32,8 +32,9 @@ OpenTraderPro_MarketPlace/
 │   ├── adx_ema_intraday.txt
 │   └── mis_exit_all.txt
 └── indicators/               Custom charting overlays (BaseIndicator)
-    └── averages/
-        └── vwap.txt
+    ├── averages/             SMA, EMA, DEMA, TEMA, WMA, VWAP, Parabolic SAR
+    ├── bands/                Bollinger, Keltner, Ichimoku
+    └── oscillators/          RSI, MACD, Stochastic, ADX, Aroon, ATR, CCI, MFI, OBV, Williams %R
 ```
 
 ---
@@ -95,7 +96,26 @@ The Accounts panel "Get example plugins" button will eventually open this reposi
 
 | Indicator | Category | One-line summary |
 |---|---|---|
-| `vwap` | averages | Volume-weighted average price overlay |
+| `sma` | averages | Simple moving average |
+| `ema` | averages | Exponential moving average |
+| `dema` | averages | Double exponential moving average |
+| `tema` | averages | Triple exponential moving average |
+| `wma` | averages | Weighted moving average |
+| `vwap` | averages | Volume-weighted average price (intraday session-anchored) |
+| `parabolic_sar` | averages | Parabolic Stop-and-Reverse trailing stop |
+| `bollinger` | bands | Bollinger Bands (SMA ± k·σ) |
+| `keltner` | bands | Keltner Channels (EMA ± k·ATR) |
+| `ichimoku` | bands | Ichimoku Cloud (5-line equilibrium chart) |
+| `rsi` | oscillators | Relative Strength Index |
+| `macd` | oscillators | Moving Average Convergence/Divergence |
+| `stochastic` | oscillators | Stochastic Oscillator (%K + %D) |
+| `adx` | oscillators | Average Directional Index (trend strength) |
+| `aroon` | oscillators | Aroon Up/Down (trend identification) |
+| `atr` | oscillators | Average True Range (volatility) |
+| `cci` | oscillators | Commodity Channel Index |
+| `mfi` | oscillators | Money Flow Index (volume-weighted RSI) |
+| `obv` | oscillators | On-Balance Volume |
+| `williams_r` | oscillators | Williams %R (momentum) |
 
 ---
 

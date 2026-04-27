@@ -1,0 +1,38 @@
+"""Relative Strength Index indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class RSI(BaseIndicator):
+    """RSI — momentum oscillator measuring speed of price changes."""
+
+    name = "RSI"
+    short_name = "RSI"
+    description = "Relative Strength Index (0-100 scale)."
+    overlay_on_price = False
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 14, "overbought": 70, "oversold": 30}
+        self.add_line("rsi", "RSI", color="#2962FF")
+        self.add_line("overbought", "Overbought", color="#FF5252", style="dash")
+        self.add_line("oversold", "Oversold", color="#4CAF50", style="dash")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        close = self._col(df, "close")
+        
+        # Standard TA-Lib RSI
+        self.lines["rsi"].data = talib.RSI(close, timeperiod=period)
+        
+        # Update static bands
+        n = len(close)
+        self.lines["overbought"].data = np.full(n, self.parameters["overbought"])
+        self.lines["oversold"].data = np.full(n, self.parameters["oversold"])
+
+    def get_value_range(self):
+        return (-5, 105)

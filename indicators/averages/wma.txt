@@ -1,0 +1,26 @@
+"""Weighted Moving Average indicator."""
+
+import numpy as np
+import pandas as pd
+import talib
+
+from opentrader.indicators.base import BaseIndicator
+
+
+class WMA(BaseIndicator):
+    """Weighted Moving Average."""
+
+    name = "Weighted Moving Average"
+    short_name = "WMA"
+    description = "Weighted average giving more importance to recent prices."
+    overlay_on_price = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parameters = {"period": 20}
+        self.add_line("wma", "WMA", color="#9C27B0")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        period = self.parameters["period"]
+        close = self._col(df, "close")
+        self.lines["wma"].data = talib.WMA(close, timeperiod=period)
