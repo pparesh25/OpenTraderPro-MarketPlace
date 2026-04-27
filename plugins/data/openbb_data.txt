@@ -1,0 +1,742 @@
+# plugin-type: plugin-data
+"""OpenBB Platform — v2 :class:`DataPluginV2` implementation.
+
+OpenBB Platform (v4+) is a single SDK that routes requests to many data
+backends. This plugin exposes a v2 data-only plugin that fans every
+historical/search request through a user-selected backend.
+
+Provider backends
+-----------------
+Free (no key):  yfinance, CBOE, ECB, Federal Reserve, SEC, TMX
+Paid:           FMP, Polygon.io, Intrinio, Alpha Vantage, Tiingo, Tradier,
+                Nasdaq Data Link
+
+Design
+------
+* Each :class:`AccountInstance` owns its own plugin — two aliases
+  (e.g. ``openbb::yf`` and ``openbb::polygon``) can run concurrently.
+* API keys live in :class:`CredentialVault`; the plugin applies them to
+  OpenBB on :meth:`configure`.
+* OpenBB is an optional runtime dependency — import-guarded via
+  ``OPENBB_AVAILABLE``. Unit tests monkeypatch the module-level ``obb``
+  object so the suite runs in CI without the SDK installed.
+
+No execution side: OpenBB is data-only. No realtime either.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import date, datetime, time as _time
+from typing import Any, ClassVar
+from zoneinfo import ZoneInfo
+
+from opentrader.connectors_v2.contract import (
+    AuthResult,
+    Capabilities,
+    CredentialField,
+    DataPluginV2,
+    ExchangeInfo,
+    OhlcvBar,
+    PluginInfo,
+    SessionRouting,
+    SymbolInfo,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ── Graceful import — OpenBB is optional ─────────────────────────────────
+try:
+    from openbb import obb  # type: ignore[import-not-found]
+
+    OPENBB_AVAILABLE = True
+except ImportError:                                        # pragma: no cover
+    obb = None                                             # type: ignore[assignment]
+    OPENBB_AVAILABLE = False
+
+
+# ── Supported backends ────────────────────────────────────────────────────
+# (provider_id, display_label, requires_key)
+OPENBB_PROVIDERS: tuple[tuple[str, str, bool], ...] = (
+    # Free / no-key
+    ("yfinance",        "yfinance (Yahoo Finance — no key)",   False),
+    ("cboe",            "CBOE (Options/Index — no key)",       False),
+    ("ecb",             "ECB (FX rates — no key)",             False),
+    ("federal_reserve", "Federal Reserve (macro — no key)",    False),
+    ("sec",             "SEC (filings/equity — no key)",       False),
+    ("tmx",             "TMX (Canada — no key)",               False),
+    # Paid / key required
+    ("fmp",             "Financial Modeling Prep (FMP)",       True),
+    ("polygon",         "Polygon.io",                          True),
+    ("intrinio",        "Intrinio",                            True),
+    ("alpha_vantage",   "Alpha Vantage",                       True),
+    ("tiingo",          "Tiingo",                              True),
+    ("tradier",         "Tradier",                             True),
+    ("nasdaq",          "Nasdaq Data Link (Quandl)",           True),
+)
+
+# provider_id → credential-schema field name
+PROVIDER_KEY_FIELD: dict[str, str] = {
+    "fmp":           "fmp_api_key",
+    "polygon":       "polygon_api_key",
+    "intrinio":      "intrinio_api_key",
+    "alpha_vantage": "alpha_vantage_api_key",
+    "tiingo":        "tiingo_api_key",
+    "tradier":       "tradier_api_key",
+    "nasdaq":        "nasdaq_api_key",
+}
+
+# v2 timeframe → OpenBB interval
+_INTERVAL_MAP: dict[str, str] = {
+    "1min":  "1m",
+    "3min":  "3m",
+    "5min":  "5m",
+    "15min": "15m",
+    "30min": "30m",
+    "1hour": "1h",
+    "4hour": "4h",
+    "1day":  "1d",
+    "1week": "1W",
+    "1month": "1M",
+    # accept short aliases
+    "1m":  "1m", "5m":  "5m", "15m": "15m", "30m": "30m",
+    "1h":  "1h", "4h":  "4h",
+    "D":   "1d", "W":   "1W", "M":   "1M",
+}
+
+# Yahoo-style exchange suffixes (only used when provider == "yfinance")
+_YF_SUFFIX_MAP: dict[str, str] = {
+    "NSE": ".NS",      "BSE": ".BO",     "LSE": ".L",
+    "TSE": ".T",       "HKEX": ".HK",    "ASX": ".AX",
+    "TSX": ".TO",      "SGX": ".SI",     "KSE": ".KS",
+    "XETRA": ".DE",    "EURONEXT": ".PA",
+}
+
+# Providers primarily focused on US markets.
+_US_CENTRIC_PROVIDERS: frozenset[str] = frozenset({
+    "fmp", "polygon", "intrinio", "alpha_vantage",
+    "tiingo", "tradier", "nasdaq",
+})
+
+# v2 segment taxonomy — kept stable; routing keyed on these.
+_SEG_EQUITY = "EQUITY"
+_SEG_CRYPTO = "CRYPTO_SPOT"
+_SEG_FOREX = "FOREX"
+_SEG_ETF = "ETF"
+_SEG_INDEX = "INDEX"
+_SEG_COMMODITY = "COMMODITY"
+_SEG_DERIV = "DERIVATIVES"
+
+SUPPORTED_SEGMENTS: tuple[str, ...] = (
+    _SEG_EQUITY, _SEG_CRYPTO, _SEG_FOREX, _SEG_ETF,
+    _SEG_INDEX, _SEG_COMMODITY, _SEG_DERIV,
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Plugin
+# ══════════════════════════════════════════════════════════════════════════
+class DataPlugin(DataPluginV2):
+    """Multi-provider historical data via OpenBB Platform.
+
+    No realtime, no search-by-broker-token — exchange hints come from
+    :class:`SymbolInfo` returned by :meth:`search_symbols`.
+    """
+
+    INFO: ClassVar[PluginInfo] = PluginInfo(
+        name="openbb",
+        display_name="OpenBB (multi-provider)",
+        version="2.1.0",
+        author="OpenTrader",
+        min_app_api="2.0",
+        description=(
+            "Historical market data via OpenBB Platform SDK v4. "
+            "Free backends: yfinance, CBOE, ECB, Federal Reserve, SEC, TMX. "
+            "Paid backends (FMP, Polygon, Alpha Vantage, …) require API keys. "
+            "Install: pip install openbb"
+        ),
+    )
+
+    CREDENTIAL_SCHEMA: ClassVar[tuple[CredentialField, ...]] = (
+        CredentialField(
+            name="preferred_provider",
+            label="Preferred provider",
+            type="text",
+            required=True,
+            help_text=(
+                "One of: yfinance (default), cboe, ecb, federal_reserve, sec, "
+                "tmx, fmp, polygon, intrinio, alpha_vantage, tiingo, tradier, "
+                "nasdaq."
+            ),
+        ),
+        CredentialField(
+            name="fmp_api_key", label="FMP API key",
+            type="password", required=False,
+        ),
+        CredentialField(
+            name="polygon_api_key", label="Polygon.io API key",
+            type="password", required=False,
+        ),
+        CredentialField(
+            name="intrinio_api_key", label="Intrinio API key",
+            type="password", required=False,
+        ),
+        CredentialField(
+            name="alpha_vantage_api_key", label="Alpha Vantage API key",
+            type="password", required=False,
+        ),
+        CredentialField(
+            name="tiingo_api_key", label="Tiingo API key",
+            type="password", required=False,
+        ),
+        CredentialField(
+            name="tradier_api_key", label="Tradier API key",
+            type="password", required=False,
+        ),
+        CredentialField(
+            name="nasdaq_api_key", label="Nasdaq Data Link API key",
+            type="password", required=False,
+        ),
+    )
+
+    CAPABILITIES: ClassVar[Capabilities] = Capabilities(
+        segments=SUPPORTED_SEGMENTS,
+        realtime=False,
+        historical=True,
+        search=True,
+    )
+
+    # ── Construction ─────────────────────────────────────────────────────
+    def __init__(self, alias: str) -> None:
+        super().__init__(alias)
+        self._configured = False
+        self._preferred_provider: str = "yfinance"
+        self._api_keys: dict[str, str] = {}
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+    def configure(
+        self,
+        credentials: dict[str, str],
+        *,
+        routing: SessionRouting | None = None,
+    ) -> None:
+        """Stash credentials; apply provider keys to OpenBB if available.
+
+        V3 §N2 — OpenBB providers (yfinance, alpha-vantage, fmp, …) are
+        general-purpose market-data sources that don't sit behind a
+        broker static-IP allowlist; ``routing`` is accepted for ABC
+        conformance and deliberately ignored.
+        """
+        del routing
+        self._preferred_provider = (
+            credentials.get("preferred_provider") or "yfinance"
+        ).strip() or "yfinance"
+
+        self._api_keys = {}
+        for provider_id, field in PROVIDER_KEY_FIELD.items():
+            key = (credentials.get(field) or "").strip()
+            if not key:
+                continue
+            self._api_keys[provider_id] = key
+            if OPENBB_AVAILABLE:
+                try:
+                    _set_openbb_provider_key(obb, provider_id, key)
+                except Exception as exc:                   # noqa: BLE001
+                    logger.warning(
+                        "OpenBB: could not register key for %s: %s",
+                        provider_id, exc,
+                    )
+
+        self._configured = True
+        logger.info(
+            "OpenBB plugin configured (alias=%s, provider=%s, keyed=%s)",
+            self.alias, self._preferred_provider, sorted(self._api_keys),
+        )
+
+    def authenticate(self) -> AuthResult:
+        """OpenBB is keyless by default (yfinance works). Paid providers
+        only need their key on configure()."""
+        if not OPENBB_AVAILABLE:
+            return AuthResult(
+                ok=False, error="OpenBB not installed — run: pip install openbb",
+            )
+        # Paid provider requested but no key supplied → hard fail early.
+        pid = self._preferred_provider
+        if pid in PROVIDER_KEY_FIELD and pid not in self._api_keys:
+            return AuthResult(
+                ok=False,
+                error=f"Provider '{pid}' requires an API key.",
+            )
+        self._authenticated = True
+        return AuthResult(ok=True)
+
+    def test_connection(self) -> bool:
+        """Cheap liveness probe. Returns ``True`` if the module is loadable
+        and the configured provider isn't missing a required key. A real
+        network round-trip would be expensive for a liveness probe so the
+        probe is structural, not live."""
+        if not OPENBB_AVAILABLE or obb is None:
+            return False
+        pid = self._preferred_provider
+        if pid in PROVIDER_KEY_FIELD and pid not in self._api_keys:
+            return False
+        return True
+
+    def shutdown(self) -> None:
+        self._configured = False
+        self._api_keys.clear()
+        super().shutdown()
+
+    def get_timezone(self, segment: str | None = None) -> ZoneInfo:
+        """OpenBB aggregates many global venues; UTC is the only zone with
+        no implicit assumption. Per-symbol exchange-local zones are out of
+        scope for F1 — F5 will let the holiday/calendar layer narrow it."""
+        return ZoneInfo("UTC")
+
+    # ── Historical ───────────────────────────────────────────────────────
+    def fetch_historical(
+        self,
+        symbol: str,
+        exchange: str,
+        timeframe: str,
+        start: date,
+        end: date,
+    ) -> list[OhlcvBar]:
+        """Fetch OHLCV bars via the configured OpenBB provider.
+
+        Exchange hint drives Yahoo-style symbol suffix when provider is
+        ``yfinance``. Returns ``[]`` when OpenBB is absent or the response
+        is empty — callers get a clean "no bars" answer either way.
+        """
+        if not OPENBB_AVAILABLE or obb is None:
+            logger.warning(
+                "OpenBB not installed — fetch_historical returning empty.",
+            )
+            return []
+
+        if end < start:
+            return []
+
+        interval = _INTERVAL_MAP.get(timeframe, "1d")
+        start_str = start.strftime("%Y-%m-%d")
+        end_str = end.strftime("%Y-%m-%d")
+
+        provider = self._preferred_provider
+        segment = _detect_segment(symbol, exchange)
+        resolved = _resolve_symbol(symbol, exchange, provider)
+
+        logger.debug(
+            "openbb.%s.fetch_historical: %s/%s → resolved=%s seg=%s intv=%s "
+            "range=%s→%s",
+            self.alias, symbol, exchange, resolved, segment, interval,
+            start_str, end_str,
+        )
+
+        try:
+            result = _fetch_by_segment(
+                obb=obb,
+                segment=segment,
+                symbol=resolved,
+                start=start_str,
+                end=end_str,
+                interval=interval,
+                provider=provider,
+            )
+        except Exception as exc:                           # noqa: BLE001
+            logger.error(
+                "OpenBB fetch failed (symbol=%s provider=%s seg=%s): %s",
+                resolved, provider, segment, exc,
+            )
+            return []
+
+        bars = _to_ohlcv_bars(result, timeframe)
+        return bars
+
+    # ── Search ───────────────────────────────────────────────────────────
+    def search_symbols(
+        self,
+        query: str,
+        exchange: str | None = None,
+        segment: str | None = None,
+    ) -> list[SymbolInfo]:
+        if not OPENBB_AVAILABLE or obb is None:
+            return []
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        provider = self._preferred_provider
+        # OpenBB splits search across namespaces (equity, crypto, …) —
+        # ``segment`` directly names a namespace; we only look there when
+        # it's supplied, cutting extra provider calls on MCX-only /
+        # crypto-only watchlists. ``exchange`` alone doesn't name a
+        # namespace so we leave the full sweep in place for that case.
+        all_segments = (
+            ("EQUITY",      "equity"),
+            ("CRYPTO_SPOT", "crypto"),
+            ("ETF",         "etf"),
+            ("INDEX",       "index"),
+        )
+        if segment:
+            want = segment.upper()
+            target_segments = tuple(s for s in all_segments if s[0] == want) or all_segments
+        else:
+            target_segments = all_segments
+
+        raws: list[dict[str, Any]] = []
+        for seg_label, namespace in target_segments:
+            try:
+                ns = getattr(obb, namespace, None)
+                fn = getattr(ns, "search", None) if ns else None
+                if fn is None:
+                    continue
+                result = fn(q, provider=provider)
+                rows = _result_to_records(result)
+                for row in rows:
+                    raws.append({"segment": seg_label, **row})
+                if raws:
+                    break   # first matching segment wins, matches v1 heuristic
+            except Exception as exc:                       # noqa: BLE001
+                logger.debug(
+                    "OpenBB search in %s failed for %r: %s",
+                    namespace, q, exc,
+                )
+                continue
+
+        infos: list[SymbolInfo] = []
+        for row in raws[:50]:
+            sym = str(row.get("symbol") or "").strip()
+            if not sym:
+                continue
+            infos.append(SymbolInfo(
+                symbol=sym,
+                exchange=str(row.get("exchange") or row.get("stock_exchange") or ""),
+                segment=str(row.get("segment") or _SEG_EQUITY),
+                tick_size=0.01,
+                lot_size=1,
+                display_name=str(row.get("name") or row.get("short_name") or ""),
+            ))
+        return infos
+
+    # ── Exchange catalogue ───────────────────────────────────────────────
+    def get_supported_exchanges(self) -> list[ExchangeInfo]:
+        """Return US exchanges when the provider is US-centric, otherwise
+        a wider global list."""
+        us = [
+            ExchangeInfo("NASDAQ", "NASDAQ"),
+            ExchangeInfo("NYSE", "New York Stock Exchange"),
+            ExchangeInfo("AMEX", "American Stock Exchange"),
+            ExchangeInfo("CBOE", "Chicago Board Options Exchange"),
+        ]
+        global_ = [
+            ExchangeInfo("NSE", "National Stock Exchange (India)"),
+            ExchangeInfo("BSE", "Bombay Stock Exchange"),
+            ExchangeInfo("LSE", "London Stock Exchange"),
+            ExchangeInfo("TSE", "Tokyo Stock Exchange"),
+            ExchangeInfo("HKEX", "Hong Kong Exchange"),
+            ExchangeInfo("ASX", "Australian Securities Exchange"),
+            ExchangeInfo("TSX", "Toronto Stock Exchange"),
+            ExchangeInfo("SGX", "Singapore Exchange"),
+            ExchangeInfo("XETRA", "Deutsche Börse (Xetra)"),
+            ExchangeInfo("EURONEXT", "Euronext"),
+        ]
+        universal = [
+            ExchangeInfo("CRYPTO", "Cryptocurrency (all)"),
+            ExchangeInfo("FOREX", "Forex"),
+            ExchangeInfo("INDEX", "Market indices"),
+            ExchangeInfo("ETF", "Exchange-Traded Funds"),
+            ExchangeInfo("COMMODITY", "Commodities"),
+        ]
+        if self._preferred_provider in _US_CENTRIC_PROVIDERS:
+            return us + universal
+        return us + global_ + universal
+
+    # ── Public helpers (used by UI, not the contract) ────────────────────
+    @staticmethod
+    def get_available_providers() -> list[dict[str, Any]]:
+        """Return provider metadata ready for a Broker Manager dropdown."""
+        return [
+            {"id": pid, "label": label, "requires_key": req}
+            for pid, label, req in OPENBB_PROVIDERS
+        ]
+
+    @property
+    def preferred_provider(self) -> str:
+        return self._preferred_provider
+
+    @property
+    def configured_api_keys(self) -> tuple[str, ...]:
+        """Which paid providers have a live key. (Tests + UI diagnostics.)"""
+        return tuple(sorted(self._api_keys))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Module-level helpers (pure — easy to unit-test)
+# ══════════════════════════════════════════════════════════════════════════
+def _detect_segment(symbol: str, exchange: str) -> str:
+    """Heuristic symbol/exchange → v2 segment mapping. Mirrors v1 logic."""
+    sym = (symbol or "").upper()
+    exc = (exchange or "").upper()
+
+    if exc in ("CRYPTO", "BINANCE", "COINBASE", "KRAKEN"):
+        return _SEG_CRYPTO
+    if sym.endswith("USDT") or sym.endswith("USDC"):
+        return _SEG_CRYPTO
+    if "BTC" in sym and not exc.startswith(("NYSE", "NASDAQ", "NSE", "BSE")):
+        return _SEG_CRYPTO
+
+    if exc == "FOREX" or "/" in (symbol or ""):
+        return _SEG_FOREX
+    if (
+        len(sym) == 6 and sym.isalpha()
+        and any(p in sym for p in ("EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD"))
+    ):
+        return _SEG_FOREX
+
+    if exc == "ETF":
+        return _SEG_ETF
+    if exc == "INDEX" or sym.startswith("^") or sym.startswith("."):
+        return _SEG_INDEX
+    if exc == "COMMODITY":
+        return _SEG_COMMODITY
+    if sym in ("GC", "SI", "CL", "NG", "ZW", "ZC", "ZS", "HG", "PL", "PA"):
+        return _SEG_COMMODITY
+    if exc in ("CBOE", "OPTIONS", "FUTURES"):
+        return _SEG_DERIV
+
+    return _SEG_EQUITY
+
+
+def _resolve_symbol(symbol: str, exchange: str, provider: str) -> str:
+    """Apply Yahoo-style suffixes for ``yfinance``; pass-through otherwise."""
+    ticker = (symbol or "").upper()
+    if ":" in ticker:
+        ticker = ticker.split(":", 1)[1]
+    if provider != "yfinance":
+        return ticker
+    exc = (exchange or "").upper()
+
+    # Crypto: BTCUSDT → BTC-USD
+    if exc in ("CRYPTO", "BINANCE", "COINBASE", "KRAKEN") or ticker.endswith("USDT"):
+        if ticker.endswith("USDT"):
+            return ticker[:-4] + "-USD"
+        if not ticker.endswith("-USD"):
+            return f"{ticker}-USD"
+        return ticker
+
+    if "." in ticker or "-" in ticker:
+        return ticker
+
+    return f"{ticker}{_YF_SUFFIX_MAP.get(exc, '')}"
+
+
+def _fetch_by_segment(
+    *,
+    obb: Any,
+    segment: str,
+    symbol: str,
+    start: str,
+    end: str,
+    interval: str,
+    provider: str,
+) -> Any:
+    """Route a fetch to the correct OpenBB namespace for ``segment``."""
+    if segment == _SEG_CRYPTO:
+        return obb.crypto.price.historical(
+            symbol=symbol, start_date=start, end_date=end,
+            interval=interval, provider=provider,
+        )
+    if segment == _SEG_FOREX:
+        return obb.currency.price.historical(
+            symbol=symbol, start_date=start, end_date=end,
+            interval=interval, provider=provider,
+        )
+    if segment == _SEG_ETF:
+        return obb.etf.historical(
+            symbol=symbol, start_date=start, end_date=end,
+            interval=interval, provider=provider,
+        )
+    if segment == _SEG_INDEX:
+        return obb.index.price.historical(
+            symbol=symbol, start_date=start, end_date=end,
+            interval=interval, provider=provider,
+        )
+    if segment == _SEG_DERIV:
+        return obb.derivatives.price.historical(
+            symbol=symbol, start_date=start, end_date=end,
+            provider=provider,
+        )
+    # equity + commodity fallback (commodity futures share the equity route)
+    return obb.equity.price.historical(
+        symbol=symbol, start_date=start, end_date=end,
+        interval=interval, provider=provider,
+    )
+
+
+def _to_ohlcv_bars(result: Any, timeframe: str) -> list[OhlcvBar]:
+    """Convert an OpenBB response object → list[OhlcvBar].
+
+    OpenBB responses expose a ``to_df()`` that yields a DataFrame with a
+    timestamp index. We translate to the v2 wire dataclass — no pandas in
+    the caller path.
+    """
+    if result is None or not hasattr(result, "to_df"):
+        return []
+    try:
+        df = result.to_df()
+    except Exception as exc:                               # noqa: BLE001
+        logger.debug("result.to_df() raised: %s", exc)
+        return []
+    if df is None or df.empty:
+        return []
+
+    df = df.reset_index()
+
+    # Map whatever the provider returned to our canonical column names.
+    col_map: dict[str, str] = {}
+    for col in df.columns:
+        lower = str(col).lower()
+        if lower in ("date", "datetime", "timestamp", "time"):
+            col_map[col] = "timestamp"
+        elif lower == "open":
+            col_map[col] = "open"
+        elif lower == "high":
+            col_map[col] = "high"
+        elif lower == "low":
+            col_map[col] = "low"
+        elif lower in ("close", "adj_close", "adj close"):
+            col_map[col] = "close"
+        elif lower in ("volume", "vol"):
+            col_map[col] = "volume"
+    df = df.rename(columns=col_map)
+
+    for required in ("timestamp", "open", "high", "low", "close"):
+        if required not in df.columns:
+            logger.warning(
+                "OpenBB: missing required column %r in response.", required,
+            )
+            return []
+    if "volume" not in df.columns:
+        df["volume"] = 0
+
+    intraday = _is_intraday(timeframe)
+
+    bars: list[OhlcvBar] = []
+    for _, row in df.iterrows():
+        ts_raw = row["timestamp"]
+        dt = _coerce_datetime(ts_raw, intraday=intraday)
+        if dt is None:
+            continue
+        try:
+            bars.append(OhlcvBar(
+                timestamp=dt,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=int(row["volume"]) if row["volume"] == row["volume"] else 0,
+            ))
+        except (TypeError, ValueError):
+            continue
+    bars.sort(key=lambda b: b.timestamp)
+    return bars
+
+
+def _coerce_datetime(value: Any, *, intraday: bool) -> datetime | None:
+    """Coerce an arbitrary timestamp-ish value into a ``datetime``.
+
+    For daily/weekly bars the time component is forced to 15:30 IST-style
+    close (matches OpenTrader convention).
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, _time(15, 30)) if not intraday else datetime.combine(value, _time())
+    if hasattr(value, "to_pydatetime"):
+        try:
+            return value.to_pydatetime()
+        except Exception as exc:                           # pragma: no cover
+            logger.debug("to_pydatetime() raised on %r: %s", type(value), exc)
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            try:
+                d = datetime.strptime(value[:10], "%Y-%m-%d")
+                return d if intraday else d.replace(hour=15, minute=30)
+            except ValueError:
+                return None
+    return None
+
+
+def _is_intraday(timeframe: str) -> bool:
+    tf = (timeframe or "").lower()
+    return tf.endswith("min") or tf.endswith("hour") or tf.endswith("m") or tf.endswith("h")
+
+
+def _result_to_records(result: Any) -> list[dict[str, Any]]:
+    """OpenBB search result → list[dict[str, Any]]. Tolerant of many shapes."""
+    if result is None:
+        return []
+    if hasattr(result, "to_df"):
+        try:
+            df = result.to_df().head(50)
+            return df.to_dict("records")
+        except Exception as exc:                           # noqa: BLE001
+            logger.debug("result.to_df() → records failed: %s", exc)
+    if hasattr(result, "results"):
+        res = result.results
+        if isinstance(res, list):
+            return [_obj_to_dict(r) for r in res[:50]]
+    return []
+
+
+def _obj_to_dict(obj: Any) -> dict[str, Any]:
+    if isinstance(obj, dict):
+        return obj
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump()
+        except Exception as exc:                           # pragma: no cover
+            logger.debug("model_dump() raised on %r: %s", type(obj), exc)
+    if hasattr(obj, "__dict__"):
+        return dict(vars(obj))
+    return {}
+
+
+def _set_openbb_provider_key(obb_instance: Any, provider_id: str, api_key: str) -> None:
+    """Set a provider API key via OpenBB v4's ``obb.user.credentials`` path,
+    falling back to the legacy ``obb.account.credentials`` attribute."""
+    cred_attr = f"{provider_id}_api_key"
+
+    # Primary — v4 path
+    user = getattr(obb_instance, "user", None)
+    creds = getattr(user, "credentials", None) if user is not None else None
+    if creds is not None:
+        if hasattr(creds, cred_attr):
+            setattr(creds, cred_attr, api_key)
+            return
+        model_fields = (
+            getattr(creds, "model_fields", None)
+            or getattr(creds, "__fields__", {})
+            or {}
+        )
+        if cred_attr in model_fields:
+            object.__setattr__(creds, cred_attr, api_key)
+            return
+
+    # Fallback — legacy path
+    account = getattr(obb_instance, "account", None)
+    creds2 = getattr(account, "credentials", None) if account is not None else None
+    if creds2 is not None and hasattr(creds2, cred_attr):
+        setattr(creds2, cred_attr, api_key)
+        return
+
+    logger.warning(
+        "OpenBB: could not set credential %r — attribute not found on "
+        "obb.user.credentials or obb.account.credentials.",
+        cred_attr,
+    )

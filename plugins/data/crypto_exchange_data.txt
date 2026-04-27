@@ -1,0 +1,757 @@
+# plugin-type: plugin-data
+"""Binance — V3 user-`.txt` data plugin.
+
+Provides crypto market data via python-binance for one alias:
+
+* Historical OHLCV klines (REST) — spot, USD-M futures, COIN-M futures
+* Real-time ticks via ``BinanceSocketManager`` (spot ticker stream)
+* Symbol search against the cached exchange-info table
+* Coverage — ``CRYPTO_SPOT``, ``USDM_FUTURES``, ``COINM_FUTURES``
+
+Two aliases (e.g. ``binance::main``, ``binance::test``) get completely
+independent :class:`BinanceSession` objects via the shared
+:mod:`opentrader.connectors_v2.session_registry` — one configured client
+per alias is shared across this file and the matching
+``crypto_exchange_exec.txt``.
+
+The :class:`BinanceSession` class body MUST be byte-identical between
+this file and ``crypto_exchange_exec.txt`` per the V3 §R2 Decision-3=3d
+contract.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import threading
+import time
+from collections.abc import Callable
+from datetime import date, datetime, time as dtime, timezone
+from types import MappingProxyType
+from typing import Any, ClassVar
+from zoneinfo import ZoneInfo
+
+from opentrader.connectors_v2 import session_registry
+from opentrader.connectors_v2.contract import (
+    AuthResult,
+    Capabilities,
+    CredentialField,
+    DataPluginV2,
+    ExchangeInfo,
+    MarketWindow,
+    OhlcvBar,
+    PluginInfo,
+    SessionRouting,
+    SymbolInfo,
+    Tick,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# ── Optional dependency ────────────────────────────────────────────────
+try:
+    from binance.client import Client
+    from binance.exceptions import BinanceAPIException
+    from binance.streams import BinanceSocketManager
+
+    BINANCE_AVAILABLE = True
+except ImportError:
+    BINANCE_AVAILABLE = False
+    Client = None                      # type: ignore[assignment,misc]
+    BinanceSocketManager = None        # type: ignore[assignment,misc]
+    BinanceAPIException = Exception    # type: ignore[misc,assignment]
+    logger.info(
+        "python-binance not installed — binance plugin reports unavailable. "
+        "Install with: pip install python-binance"
+    )
+
+
+# ── Public maps (stable across aliases) ────────────────────────────────
+# Timeframe tokens used by the rest of OpenTrader (data_types / UI) map to
+# python-binance interval strings. Accept both the long v2 form ("1min")
+# and the short v1 form ("1m") for continuity.
+TIMEFRAME_MAP: dict[str, str] = {
+    "1min": "1m", "3min": "3m", "5min": "5m", "15min": "15m", "30min": "30m",
+    "1hour": "1h", "2hour": "2h", "4hour": "4h", "6hour": "6h", "12hour": "12h",
+    "1day": "1d", "3day": "3d", "1week": "1w", "1month": "1M",
+    # v1-style short aliases
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h", "12h": "12h",
+    "D": "1d", "3D": "3d", "W": "1w", "M": "1M",
+    "1d": "1d", "3d": "3d", "1w": "1w",
+}
+
+# Canonical v2 segment strings this plugin handles.
+SPOT = "CRYPTO_SPOT"
+USDM = "USDM_FUTURES"
+COINM = "COINM_FUTURES"
+SUPPORTED_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BinanceSession — one per alias. BYTE-IDENTICAL with crypto_exchange_exec.txt.
+# Both sides construct via session_registry.get_or_create_session(
+#   namespace="binance", alias=…, factory=BinanceSession) so a single
+# configured python-binance Client + symbol cache covers both sides.
+# ══════════════════════════════════════════════════════════════════════
+class BinanceSession:
+    """Owns one python-binance ``Client`` for a single alias.
+
+    Never construct directly — always go through
+    ``session_registry.get_or_create_session(namespace="binance", alias=…,
+    factory=BinanceSession)`` so the data + exec ``.txt`` files share one
+    configured client + exchange-info cache per alias.
+    """
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        self._api_key: str = ""
+        self._api_secret: str = ""
+        self._testnet: bool = False
+        self._configured: bool = False
+        self._authenticated: bool = False
+
+        self._client: object | None = None           # binance.client.Client
+
+        # Per-segment exchange-info caches ({"BTCUSDT": {…filters…}, …}).
+        self._symbol_cache: dict[str, dict[str, dict]] = {
+            SPOT: {}, USDM: {}, COINM: {},
+        }
+        self._last_symbol_update: dict[str, float] = {
+            SPOT: 0.0, USDM: 0.0, COINM: 0.0,
+        }
+
+        # Serialise concurrent REST calls — python-binance's ``Client``
+        # wraps a ``requests.Session`` not safe for concurrent use across
+        # kline + order calls.
+        self.api_lock = threading.Lock()
+
+        # User-data-stream push channel (V3 §F7). The exec plugin registers
+        # a parser via :meth:`register_user_event_handler`; the WS lifecycle
+        # owner (:class:`BinanceUserDataWorker` in the exec fixture) calls
+        # :meth:`dispatch_user_event` when Binance sends an
+        # ``executionReport`` (spot) or ``ORDER_TRADE_UPDATE`` (futures).
+        self._user_event_handler: Callable[[dict], None] | None = None
+
+    # ── Basic predicates ─────────────────────────────────────────────
+    @property
+    def is_available(self) -> bool:
+        return BINANCE_AVAILABLE
+
+    @property
+    def is_configured(self) -> bool:
+        return self._configured and self._client is not None
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._authenticated
+
+    @property
+    def client(self) -> object | None:
+        return self._client
+
+    @property
+    def testnet(self) -> bool:
+        return self._testnet
+
+    # ── Configuration ────────────────────────────────────────────────
+    def configure(
+        self, api_key: str, api_secret: str, testnet: bool = False
+    ) -> bool:
+        """Initialise the ``Client``. Idempotent: reuses the existing client
+        when the key/secret/testnet triple hasn't changed."""
+        if not BINANCE_AVAILABLE:
+            return False
+        if (
+            self._client is not None
+            and self._api_key == api_key
+            and self._api_secret == api_secret
+            and self._testnet == testnet
+        ):
+            return True
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._testnet = testnet
+        try:
+            self._client = Client(api_key, api_secret, testnet=testnet)
+            self._configured = True
+            logger.info(
+                "BinanceSession[%s] configured (testnet=%s, api_key=%s***)",
+                self.alias, testnet, api_key[:4] if api_key else "",
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "BinanceSession[%s] configure failed: %s", self.alias, exc,
+            )
+            self._client = None
+            self._configured = False
+            return False
+
+    # ── Connectivity + auth ──────────────────────────────────────────
+    def ping(self) -> tuple[bool, str]:
+        """Cheap liveness + clock-skew check. Does not require API keys."""
+        if self._client is None:
+            return False, "Not configured"
+        try:
+            with self.api_lock:
+                self._client.ping()
+                server = self._client.get_server_time()
+            local_ms = int(time.time() * 1000)
+            diff = abs(int(server.get("serverTime", local_ms)) - local_ms)
+            msg = f"Connected to Binance{' (Testnet)' if self._testnet else ''}."
+            if diff > 5000:
+                msg += f" Clock skew: {diff}ms"
+            return True, msg
+        except Exception as exc:
+            return False, f"Connection failed: {exc}"
+
+    def authenticate(self) -> tuple[bool, str]:
+        """Verify API keys by calling ``client.get_account()``."""
+        if self._client is None:
+            return False, "Not configured"
+        try:
+            with self.api_lock:
+                self._client.get_account()
+            self._authenticated = True
+            logger.info("BinanceSession[%s] authenticated", self.alias)
+            return True, "Authenticated with Binance."
+        except BinanceAPIException as exc:
+            msg = getattr(exc, "message", str(exc))
+            logger.error("BinanceSession[%s] auth failed: %s", self.alias, msg)
+            return False, f"Auth failed: {msg}"
+        except Exception as exc:
+            logger.error(
+                "BinanceSession[%s] auth error: %s", self.alias, exc,
+            )
+            return False, f"Auth error: {exc}"
+
+    # ── Exchange info cache ──────────────────────────────────────────
+    def load_symbols(self, segment: str = SPOT, force: bool = False) -> None:
+        """Fetch and cache exchange info for ``segment`` (1 h TTL)."""
+        if self._client is None or segment not in SUPPORTED_SEGMENTS:
+            return
+        if (
+            not force
+            and time.time() - self._last_symbol_update[segment] < 3600
+            and self._symbol_cache[segment]
+        ):
+            return
+
+        fetcher = {
+            SPOT:  "get_exchange_info",
+            USDM:  "futures_exchange_info",
+            COINM: "futures_coin_exchange_info",
+        }[segment]
+        try:
+            with self.api_lock:
+                info = getattr(self._client, fetcher)()
+            cache: dict[str, dict] = {}
+            for sym in info.get("symbols", []):
+                cache[sym["symbol"].upper()] = sym
+            self._symbol_cache[segment] = cache
+            self._last_symbol_update[segment] = time.time()
+            logger.info(
+                "BinanceSession[%s] cached %d %s symbols",
+                self.alias, len(cache), segment,
+            )
+        except Exception as exc:
+            logger.warning(
+                "BinanceSession[%s] load_symbols(%s) failed: %s",
+                self.alias, segment, exc,
+            )
+
+    def symbol_info(self, symbol: str, segment: str = SPOT) -> dict | None:
+        """Return cached exchange-info row for ``symbol`` in ``segment``."""
+        return self._symbol_cache.get(segment, {}).get(symbol.upper())
+
+    def active_symbols(
+        self, segment: str = SPOT, quote_asset: str = "USDT"
+    ) -> list[str]:
+        """Return trading-active symbols in ``segment`` with the given quote."""
+        out: list[str] = []
+        for sym, info in self._symbol_cache.get(segment, {}).items():
+            status = info.get("status") or info.get("contractStatus")
+            if status != "TRADING":
+                continue
+            if quote_asset and info.get("quoteAsset") != quote_asset:
+                continue
+            out.append(sym)
+        return out
+
+    # ── Precision ────────────────────────────────────────────────────
+    def round_quantity(
+        self, symbol: str, qty: float, segment: str = SPOT
+    ) -> float:
+        """Round ``qty`` down to the segment's LOT_SIZE step."""
+        info = self.symbol_info(symbol, segment)
+        if not info:
+            return qty
+        for f in info.get("filters", []):
+            if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                return self._round_step(qty, float(f["stepSize"]))
+        return qty
+
+    def round_price(
+        self, symbol: str, price: float, segment: str = SPOT
+    ) -> float:
+        """Round ``price`` down to the segment's PRICE_FILTER tick."""
+        info = self.symbol_info(symbol, segment)
+        if not info:
+            return price
+        for f in info.get("filters", []):
+            if f.get("filterType") == "PRICE_FILTER":
+                return self._round_step(price, float(f["tickSize"]))
+        return price
+
+    # ── Realtime ─────────────────────────────────────────────────────
+    def create_ws_manager(self) -> object | None:
+        """Return a fresh ``BinanceSocketManager`` for spot ticker streams."""
+        if self._client is None or not BINANCE_AVAILABLE:
+            return None
+        return BinanceSocketManager(self._client)  # type: ignore[misc]
+
+    # ── User-data-stream push channel (V3 §F7) ───────────────────────
+    def register_user_event_handler(
+        self, handler: Callable[[dict], None] | None
+    ) -> None:
+        """Register a parser for Binance user-data-stream events.
+
+        Called by the exec plugin at configure(). The WS lifecycle owner
+        feeds events via :meth:`dispatch_user_event`. Pass ``None`` to clear.
+        """
+        self._user_event_handler = handler
+
+    def dispatch_user_event(self, event: dict) -> None:
+        """Forward a Binance user-data event to the registered handler.
+
+        Catches handler errors so a buggy parser cannot kill the WS reactor.
+        """
+        handler = self._user_event_handler
+        if handler is None:
+            return
+        try:
+            handler(event)
+        except Exception as exc:
+            logger.exception(
+                "BinanceSession[%s] user-event handler raised: %s",
+                self.alias, exc,
+            )
+
+    # ── Internals ────────────────────────────────────────────────────
+    def _dispose(self) -> None:
+        """Drop the client + caches (called by session_registry on eviction)."""
+        self._client = None
+        self._configured = False
+        self._authenticated = False
+        for seg in SUPPORTED_SEGMENTS:
+            self._symbol_cache[seg].clear()
+            self._last_symbol_update[seg] = 0.0
+
+    @staticmethod
+    def _round_step(value: float, step: float) -> float:
+        """Round ``value`` down to the nearest multiple of ``step``.
+
+        Decimal places are inferred from ``step`` (``0.001 → 3``) so the
+        float returned doesn't carry binary-rounding artefacts. Matches v1
+        behaviour.
+        """
+        if step <= 0:
+            return value
+        step_str = format(step, "f").rstrip("0")
+        precision = len(step_str.split(".")[-1]) if "." in step_str else 0
+        rounded = math.floor(value / step + 1e-10) * step
+        return round(rounded, precision)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DataPlugin
+# ══════════════════════════════════════════════════════════════════════
+class DataPlugin(DataPluginV2):
+    """Binance data feed — one instance per alias, per-alias BinanceSession."""
+
+    INFO: ClassVar[PluginInfo] = PluginInfo(
+        name="binance",
+        display_name="Binance",
+        version="2.0.0",
+        author="OpenTrader",
+        min_app_api="2.0",
+        description=(
+            "Crypto market data via Binance — spot, USD-M futures, "
+            "COIN-M futures. Per-account sessions."
+        ),
+    )
+    CREDENTIAL_SCHEMA: ClassVar[tuple[CredentialField, ...]] = (
+        CredentialField("api_key",    "API Key",    "text"),
+        CredentialField("api_secret", "API Secret", "password"),
+        CredentialField(
+            "testnet", "Use Testnet", "checkbox", required=False,
+            help_text="Route all calls to Binance testnet instead of live.",
+        ),
+    )
+    CAPABILITIES: ClassVar[Capabilities] = Capabilities(
+        segments=SUPPORTED_SEGMENTS,
+        realtime=True,
+        historical=True,
+        search=True,
+        exchange_to_segment=MappingProxyType({
+            "BINANCE": SPOT,
+            "CRYPTO": SPOT,
+        }),
+    )
+
+    # ── Construction ─────────────────────────────────────────────────
+    def __init__(self, alias: str) -> None:
+        super().__init__(alias)
+        self._session: BinanceSession = session_registry.get_or_create_session(
+            namespace=self.INFO.name, alias=alias, factory=BinanceSession,
+        )
+        self._configured = False
+
+        # Realtime state (spot-only).
+        self._bm: Any | None = None
+        self._conn_keys: dict[str, Any] = {}        # "BTCUSDT" → socket key
+        self._on_tick: Callable[[Tick], None] | None = None
+        self._last_cum_volume: dict[str, float] = {}   # delta-volume tracker
+
+    # ── Lifecycle ────────────────────────────────────────────────────
+    def configure(
+        self,
+        credentials: dict[str, str],
+        *,
+        routing: SessionRouting | None = None,
+    ) -> None:
+        if not BINANCE_AVAILABLE:
+            raise RuntimeError(
+                "python-binance not installed. Run: pip install python-binance"
+            )
+        api_key = credentials.get("api_key", "")
+        api_secret = credentials.get("api_secret", "")
+        if not api_key or not api_secret:
+            raise ValueError("api_key and api_secret are required")
+        testnet = _coerce_bool(credentials.get("testnet", False))
+        ok = self._session.configure(api_key, api_secret, testnet)
+        if not ok:
+            raise RuntimeError("BinanceSession.configure() failed")
+        # V3 §N2 — Binance market-data REST + WS go direct (the static-IP
+        # tunnel scope is order placement only). Accept ``routing`` for
+        # ABC conformance.
+        del routing
+        self._configured = True
+
+    def authenticate(self) -> AuthResult:
+        if not BINANCE_AVAILABLE:
+            return AuthResult(ok=False, error="python-binance not installed")
+        if not self._configured:
+            return AuthResult(ok=False, error="not configured")
+        if self._session.is_authenticated:
+            self._authenticated = True
+            return AuthResult(ok=True)
+        ok, msg = self._session.authenticate()
+        if ok:
+            self._authenticated = True
+            # Pre-warm the SPOT cache so search_symbols is usable quickly.
+            self._session.load_symbols(SPOT)
+        return AuthResult(ok=ok, error="" if ok else msg)
+
+    def test_connection(self) -> bool:
+        if not self._configured or self._session.client is None:
+            return False
+        ok, _msg = self._session.ping()
+        return ok
+
+    @property
+    def is_authenticated(self) -> bool:
+        # The shared-per-alias session is the source of truth.
+        return self._session.is_authenticated
+
+    def shutdown(self) -> None:
+        self._teardown_ws()
+        session_registry.release_session(self.INFO.name, self.alias)
+        super().shutdown()
+
+    def get_timezone(self, segment: str | None = None) -> ZoneInfo:
+        """Binance feeds ship millisecond UTC epochs across every segment."""
+        return ZoneInfo("UTC")
+
+    def get_market_hours(
+        self, segment: str | None = None
+    ) -> tuple[MarketWindow, ...]:
+        """24/7 across spot, USDM and COINM (V3 §D2).
+
+        Mirrors :meth:`ExecPlugin.get_market_hours` so the realtime
+        manager can ask the data plugin directly. ``segment`` ignored
+        — the schedule is uniform across every Binance venue.
+        """
+        del segment
+        return (
+            MarketWindow(
+                dtime(0, 0),
+                dtime(23, 59, 59),
+                weekdays=(0, 1, 2, 3, 4, 5, 6),
+                tz=ZoneInfo("UTC"),
+            ),
+        )
+
+    # ── Historical ───────────────────────────────────────────────────
+    def fetch_historical(
+        self,
+        symbol: str,
+        exchange: str,
+        timeframe: str,
+        start: date,
+        end: date,
+    ) -> list[OhlcvBar]:
+        """Fetch OHLCV klines. The *segment* to hit is inferred from
+        ``exchange`` (a v2 segment string); unknown values fall back to SPOT.
+        """
+        if not self._session.is_authenticated or self._session.client is None:
+            raise RuntimeError("Not authenticated — call authenticate() first.")
+
+        segment = _resolve_segment(exchange)
+        interval = TIMEFRAME_MAP.get(timeframe, "1d")
+        start_ms = str(int(_to_utc_midnight(start).timestamp() * 1000))
+        end_ms = str(int(_to_utc_end_of_day(end).timestamp() * 1000))
+
+        fetcher = {
+            SPOT:  "get_historical_klines",
+            USDM:  "futures_historical_klines",
+            COINM: "futures_coin_historical_klines",
+        }[segment]
+
+        client = self._session.client
+        try:
+            with self._session.api_lock:
+                klines = getattr(client, fetcher)(
+                    symbol.upper(), interval, start_ms, end_ms,
+                )
+        except Exception as exc:
+            logger.error(
+                "Binance[%s] historical %s:%s failed: %s",
+                self.alias, segment, symbol, exc,
+            )
+            raise
+
+        bars = [_kline_to_bar(k) for k in (klines or [])]
+        logger.info(
+            "Binance[%s] %s:%s %s → %d bars",
+            self.alias, segment, symbol.upper(), interval, len(bars),
+        )
+        return bars
+
+    # ── Symbol search ────────────────────────────────────────────────
+    def search_symbols(
+        self,
+        query: str,
+        exchange: str | None = None,
+        segment: str | None = None,
+    ) -> list[SymbolInfo]:
+        if not self._session.is_authenticated:
+            raise RuntimeError("Not authenticated.")
+        # Binance folds exchange and segment into the same code
+        # (SPOT / USDM / COINM) — either parameter narrows the same way.
+        hint = (segment or exchange)
+        target_segments = (
+            tuple(s for s in SUPPORTED_SEGMENTS if s == hint.upper())
+            if hint else SUPPORTED_SEGMENTS
+        )
+        if not target_segments:
+            target_segments = SUPPORTED_SEGMENTS
+        # Ensure each segment cache has been populated at least once.
+        for seg in target_segments:
+            self._session.load_symbols(seg)
+
+        q = (query or "").upper()
+        hits: list[SymbolInfo] = []
+        for seg in target_segments:
+            for sym in self._session.active_symbols(seg, quote_asset=""):
+                if q and q not in sym:
+                    continue
+                info = self._session.symbol_info(sym, seg) or {}
+                hits.append(SymbolInfo(
+                    symbol=sym,
+                    exchange=seg,
+                    segment=seg,
+                    tick_size=_tick_size_of(info),
+                    lot_size=1,   # crypto uses float quantities via step_size
+                    display_name=f"{info.get('baseAsset', '')}/{info.get('quoteAsset', '')}",
+                ))
+                if len(hits) >= 20:
+                    return hits
+        return hits
+
+    def get_supported_exchanges(self) -> list[ExchangeInfo]:
+        return [
+            ExchangeInfo(code=SPOT,  name="Binance Spot"),
+            ExchangeInfo(code=USDM,  name="Binance USD-M Futures"),
+            ExchangeInfo(code=COINM, name="Binance COIN-M Futures"),
+        ]
+
+    # ── Realtime (spot only) ─────────────────────────────────────────
+    def subscribe_realtime(
+        self,
+        symbols: list[tuple[str, str]],
+        on_tick: Callable[[Tick], None],
+    ) -> None:
+        if not self._session.is_authenticated:
+            raise RuntimeError("Not authenticated.")
+        self._on_tick = on_tick
+        if self._bm is None:
+            self._bm = self._session.create_ws_manager()
+            if self._bm is None:
+                return
+
+        for sym, _exch in symbols:
+            u = sym.upper()
+            if u in self._conn_keys:
+                continue
+            try:
+                key = self._bm.start_symbol_ticker_socket(
+                    u.lower(), self._on_ticker_message,
+                )
+                self._conn_keys[u] = key
+            except Exception as exc:                     # pragma: no cover
+                logger.warning(
+                    "Binance[%s] ws subscribe %s failed: %s",
+                    self.alias, u, exc,
+                )
+
+        try:
+            self._bm.start()
+        except Exception as exc:                         # pragma: no cover
+            logger.debug("Binance[%s] ws manager start failed: %s", self.alias, exc)
+        logger.info(
+            "Binance[%s] subscribed %d spot symbols",
+            self.alias, len(self._conn_keys),
+        )
+
+    def unsubscribe_realtime(self, symbols: list[tuple[str, str]]) -> None:
+        if self._bm is None:
+            return
+        for sym, _exch in symbols:
+            u = sym.upper()
+            key = self._conn_keys.pop(u, None)
+            if key is not None:
+                try:
+                    self._bm.stop_socket(key)
+                except Exception as exc:                 # pragma: no cover
+                    logger.debug(
+                        "Binance[%s] stop_socket(%s) failed: %s",
+                        self.alias, u, exc,
+                    )
+
+    def _teardown_ws(self) -> None:
+        if self._bm is not None:
+            try:
+                self._bm.close()
+            except Exception as exc:                     # pragma: no cover
+                logger.debug(
+                    "Binance[%s] ws manager close failed: %s", self.alias, exc,
+                )
+        self._bm = None
+        self._conn_keys.clear()
+        self._on_tick = None
+        self._last_cum_volume.clear()
+
+    def _on_ticker_message(self, msg: dict) -> None:
+        """Convert a Binance !ticker payload to :class:`Tick` and dispatch."""
+        if not isinstance(msg, dict):
+            return
+        if msg.get("e") == "error" or "s" not in msg:
+            return
+        cb = self._on_tick
+        if cb is None:
+            return
+
+        symbol = str(msg["s"])
+        # Binance "v" is cumulative 24h base volume — per-tick delta helps
+        # OHLCV bar-builders reconstruct real per-tick volume.
+        cum_vol = float(msg.get("v", 0.0))
+        prev = self._last_cum_volume.get(symbol, 0.0)
+        delta = max(0, int(cum_vol - prev)) if prev > 0 else 0
+        self._last_cum_volume[symbol] = cum_vol
+
+        ts_ms = msg.get("E") or msg.get("T") or int(time.time() * 1000)
+        ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
+
+        try:
+            cb(Tick(
+                symbol=symbol,
+                exchange=SPOT,
+                price=float(msg.get("c", 0.0)),
+                volume=delta,
+                timestamp=ts,
+                bid=float(msg["b"]) if msg.get("b") else None,
+                ask=float(msg["a"]) if msg.get("a") else None,
+            ))
+        except Exception:                                # pragma: no cover
+            logger.exception("binance on_tick raised")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Helpers (pure — unit-tested directly)
+# ══════════════════════════════════════════════════════════════════════
+def _coerce_bool(value: object) -> bool:
+    """Accept bool / "true" / "1" / "yes" as True (credentials come as str)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def _resolve_segment(exchange: str) -> str:
+    """Map a v2 ``exchange`` / segment hint to a concrete Binance segment.
+
+    Accepts the three canonical v2 segments plus a handful of aliases:
+
+    * ``"BINANCE"``                 → SPOT
+    * ``"BINANCE_SPOT"`` / ``"SPOT"`` → SPOT
+    * ``"USDM"`` / ``"USD-M"``       → USDM_FUTURES
+    * ``"COINM"`` / ``"COIN-M"``     → COINM_FUTURES
+    * anything else                 → SPOT
+    """
+    if not exchange:
+        return SPOT
+    e = exchange.upper().replace("-", "_")
+    if e in (SPOT, "SPOT", "BINANCE_SPOT", "BINANCE"):
+        return SPOT
+    if e in (USDM, "USDM", "USDM_FUTURES", "USD_M", "USD_M_FUTURES", "FUTURES"):
+        return USDM
+    if e in (COINM, "COINM", "COINM_FUTURES", "COIN_M", "COIN_M_FUTURES"):
+        return COINM
+    return SPOT
+
+
+def _kline_to_bar(k: list) -> OhlcvBar:
+    """Binance kline arrays → :class:`OhlcvBar`. ``k[0]`` is open-time ms."""
+    ts = datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc)
+    return OhlcvBar(
+        timestamp=ts,
+        open=float(k[1]),
+        high=float(k[2]),
+        low=float(k[3]),
+        close=float(k[4]),
+        volume=int(float(k[5])),
+    )
+
+
+def _to_utc_midnight(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+
+
+def _to_utc_end_of_day(d: date) -> datetime:
+    return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=timezone.utc)
+
+
+def _tick_size_of(info: dict) -> float:
+    """Extract PRICE_FILTER tick size, defaulting to 0.01."""
+    for f in info.get("filters", []):
+        if f.get("filterType") == "PRICE_FILTER":
+            try:
+                return float(f["tickSize"])
+            except (TypeError, ValueError):
+                break
+    return 0.01

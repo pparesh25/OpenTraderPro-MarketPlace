@@ -1,0 +1,1843 @@
+# plugin-type: plugin-exec
+"""Binance — V3 user-`.txt` exec plugin.
+
+Places and cancels orders across spot, USD-M futures, and COIN-M futures
+with the segment inferred from the :class:`OrderRequest`. Query methods
+(``get_order_book``, ``get_positions``, ``get_margins``) aggregate
+across all three segments so the caller sees one unified view.
+
+Two aliases (e.g. ``binance::main``, ``binance::test``) get completely
+independent :class:`BinanceSession` objects via the shared
+:mod:`opentrader.connectors_v2.session_registry` — one configured client
+per alias is shared across this file and the matching
+``crypto_exchange_data.txt``.
+
+Inlined helpers
+---------------
+* :class:`BinanceSession` — byte-identical with ``crypto_exchange_data.txt``
+  per the V3 §R2 Decision-3=3d contract; the registry hands both sides
+  the same instance for the same alias.
+* ``BINANCE_24_7`` — empty calendar (Binance never closes for civil /
+  religious holidays). User-managed maintenance windows merge in via
+  ``~/.opentrader-pro/holidays/binance.json``.
+* :func:`compute_binance_fees` — taker-rate fee schedule for spot /
+  USDM / COINM (V3 §F2).
+* :func:`classify_binance_exception` — maps SDK errors onto the V3 §F9
+  broker-error taxonomy.
+* :class:`BinanceUserDataWorker` — V3 §F7 user-data-stream WS lifecycle
+  owner (listen-key + keepalive + reconnect). Inlined here rather than
+  in the data fixture because the parser bridge (``ExecPlugin._on_binance_user_event``)
+  is exec-side; the worker only feeds events into the shared session's
+  ``dispatch_user_event`` so the data side never imports it.
+* :func:`_proxy_scope` — per-call SOCKS5 routing for ``place_order`` /
+  ``cancel_order`` (V3 §N3).
+
+Design
+------
+* **Segment routing**: the Binance client exposes three parallel method
+  families (``create_order`` / ``futures_create_order`` /
+  ``futures_coin_create_order``). ``_METHODS`` picks the right quartet
+  for each segment.
+* **Cancel bookkeeping**: Binance requires ``(symbol, orderId)`` for a
+  cancel — not just the id — and the symbol differs by segment. We
+  remember ``order_id → (segment, symbol)`` at placement time so cancels
+  are cheap and segment-correct.
+* **Modify**: Binance doesn't support order modification; futures has a
+  ``modify`` endpoint but it's order-type-restricted. v2 raises
+  ``NotImplementedError`` — UI already falls back to cancel + re-place.
+* **Static-IP routing (V3 §N3)**: when the AccountRegistry threads a
+  :class:`SessionRouting` bundle through ``configure()``,
+  ``place_order`` and ``cancel_order`` apply ``routing.routed.proxy_url``
+  to the python-binance ``Client.session.proxies`` for the duration of
+  the call (see :func:`_proxy_scope`). Query methods stay direct — no
+  static-IP requirement on read endpoints. The proxy URL is re-resolved
+  per call so a tunnel drop degrades to a direct connection rather than
+  blocking the order.
+
+The :class:`BinanceSession` class body MUST be byte-identical between
+this file and ``crypto_exchange_data.txt`` per the V3 §R2 Decision-3=3d
+contract.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import threading
+import time
+from collections.abc import Callable
+from contextlib import contextmanager
+from datetime import date, datetime, time as dtime, timezone
+from types import MappingProxyType
+from typing import Any, ClassVar, Iterator, Protocol
+from zoneinfo import ZoneInfo
+
+from opentrader.connectors_v2 import session_registry
+from opentrader.connectors_v2.contract import (
+    AuthError,
+    AuthResult,
+    BrokerError,
+    BrokerRejectError,
+    CredentialField,
+    ExecCapabilities,
+    ExecPluginV2,
+    ExecutionReport,
+    Fees,
+    InsufficientFundsError,
+    InvalidOrderError,
+    Margins,
+    MarketWindow,
+    OrderModification,
+    OrderRecord,
+    OrderRequest,
+    OrderResponse,
+    PluginInfo,
+    Position,
+    RateLimit,
+    RateLimits,
+    RateLimitError,
+    SessionRouting,
+    TradeFill,
+    TransientError,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
+# ── Optional dependency ────────────────────────────────────────────────
+try:
+    from binance.client import Client
+    from binance.exceptions import BinanceAPIException
+    from binance.streams import BinanceSocketManager
+
+    BINANCE_AVAILABLE = True
+except ImportError:
+    BINANCE_AVAILABLE = False
+    Client = None                      # type: ignore[assignment,misc]
+    BinanceSocketManager = None        # type: ignore[assignment,misc]
+    BinanceAPIException = Exception    # type: ignore[misc,assignment]
+    logger.info(
+        "python-binance not installed — binance plugin reports unavailable. "
+        "Install with: pip install python-binance"
+    )
+
+
+# ── Public maps (stable across aliases) ────────────────────────────────
+# Timeframe tokens used by the rest of OpenTrader (data_types / UI) map to
+# python-binance interval strings. Accept both the long v2 form ("1min")
+# and the short v1 form ("1m") for continuity.
+TIMEFRAME_MAP: dict[str, str] = {
+    "1min": "1m", "3min": "3m", "5min": "5m", "15min": "15m", "30min": "30m",
+    "1hour": "1h", "2hour": "2h", "4hour": "4h", "6hour": "6h", "12hour": "12h",
+    "1day": "1d", "3day": "3d", "1week": "1w", "1month": "1M",
+    # v1-style short aliases
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "2h": "2h", "4h": "4h", "6h": "6h", "12h": "12h",
+    "D": "1d", "3D": "3d", "W": "1w", "M": "1M",
+    "1d": "1d", "3d": "3d", "1w": "1w",
+}
+
+# Canonical v2 segment strings this plugin handles.
+SPOT = "CRYPTO_SPOT"
+USDM = "USDM_FUTURES"
+COINM = "COINM_FUTURES"
+SUPPORTED_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# BinanceSession — one per alias. BYTE-IDENTICAL with crypto_exchange_data.txt.
+# Both sides construct via session_registry.get_or_create_session(
+#   namespace="binance", alias=…, factory=BinanceSession) so a single
+# configured python-binance Client + symbol cache covers both sides.
+# ══════════════════════════════════════════════════════════════════════
+class BinanceSession:
+    """Owns one python-binance ``Client`` for a single alias.
+
+    Never construct directly — always go through
+    ``session_registry.get_or_create_session(namespace="binance", alias=…,
+    factory=BinanceSession)`` so the data + exec ``.txt`` files share one
+    configured client + exchange-info cache per alias.
+    """
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        self._api_key: str = ""
+        self._api_secret: str = ""
+        self._testnet: bool = False
+        self._configured: bool = False
+        self._authenticated: bool = False
+
+        self._client: object | None = None           # binance.client.Client
+
+        # Per-segment exchange-info caches ({"BTCUSDT": {…filters…}, …}).
+        self._symbol_cache: dict[str, dict[str, dict]] = {
+            SPOT: {}, USDM: {}, COINM: {},
+        }
+        self._last_symbol_update: dict[str, float] = {
+            SPOT: 0.0, USDM: 0.0, COINM: 0.0,
+        }
+
+        # Serialise concurrent REST calls — python-binance's ``Client``
+        # wraps a ``requests.Session`` not safe for concurrent use across
+        # kline + order calls.
+        self.api_lock = threading.Lock()
+
+        # User-data-stream push channel (V3 §F7). The exec plugin registers
+        # a parser via :meth:`register_user_event_handler`; the WS lifecycle
+        # owner (:class:`BinanceUserDataWorker` in the exec fixture) calls
+        # :meth:`dispatch_user_event` when Binance sends an
+        # ``executionReport`` (spot) or ``ORDER_TRADE_UPDATE`` (futures).
+        self._user_event_handler: Callable[[dict], None] | None = None
+
+    # ── Basic predicates ─────────────────────────────────────────────
+    @property
+    def is_available(self) -> bool:
+        return BINANCE_AVAILABLE
+
+    @property
+    def is_configured(self) -> bool:
+        return self._configured and self._client is not None
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._authenticated
+
+    @property
+    def client(self) -> object | None:
+        return self._client
+
+    @property
+    def testnet(self) -> bool:
+        return self._testnet
+
+    # ── Configuration ────────────────────────────────────────────────
+    def configure(
+        self, api_key: str, api_secret: str, testnet: bool = False
+    ) -> bool:
+        """Initialise the ``Client``. Idempotent: reuses the existing client
+        when the key/secret/testnet triple hasn't changed."""
+        if not BINANCE_AVAILABLE:
+            return False
+        if (
+            self._client is not None
+            and self._api_key == api_key
+            and self._api_secret == api_secret
+            and self._testnet == testnet
+        ):
+            return True
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._testnet = testnet
+        try:
+            self._client = Client(api_key, api_secret, testnet=testnet)
+            self._configured = True
+            logger.info(
+                "BinanceSession[%s] configured (testnet=%s, api_key=%s***)",
+                self.alias, testnet, api_key[:4] if api_key else "",
+            )
+            return True
+        except Exception as exc:
+            logger.error(
+                "BinanceSession[%s] configure failed: %s", self.alias, exc,
+            )
+            self._client = None
+            self._configured = False
+            return False
+
+    # ── Connectivity + auth ──────────────────────────────────────────
+    def ping(self) -> tuple[bool, str]:
+        """Cheap liveness + clock-skew check. Does not require API keys."""
+        if self._client is None:
+            return False, "Not configured"
+        try:
+            with self.api_lock:
+                self._client.ping()
+                server = self._client.get_server_time()
+            local_ms = int(time.time() * 1000)
+            diff = abs(int(server.get("serverTime", local_ms)) - local_ms)
+            msg = f"Connected to Binance{' (Testnet)' if self._testnet else ''}."
+            if diff > 5000:
+                msg += f" Clock skew: {diff}ms"
+            return True, msg
+        except Exception as exc:
+            return False, f"Connection failed: {exc}"
+
+    def authenticate(self) -> tuple[bool, str]:
+        """Verify API keys by calling ``client.get_account()``."""
+        if self._client is None:
+            return False, "Not configured"
+        try:
+            with self.api_lock:
+                self._client.get_account()
+            self._authenticated = True
+            logger.info("BinanceSession[%s] authenticated", self.alias)
+            return True, "Authenticated with Binance."
+        except BinanceAPIException as exc:
+            msg = getattr(exc, "message", str(exc))
+            logger.error("BinanceSession[%s] auth failed: %s", self.alias, msg)
+            return False, f"Auth failed: {msg}"
+        except Exception as exc:
+            logger.error(
+                "BinanceSession[%s] auth error: %s", self.alias, exc,
+            )
+            return False, f"Auth error: {exc}"
+
+    # ── Exchange info cache ──────────────────────────────────────────
+    def load_symbols(self, segment: str = SPOT, force: bool = False) -> None:
+        """Fetch and cache exchange info for ``segment`` (1 h TTL)."""
+        if self._client is None or segment not in SUPPORTED_SEGMENTS:
+            return
+        if (
+            not force
+            and time.time() - self._last_symbol_update[segment] < 3600
+            and self._symbol_cache[segment]
+        ):
+            return
+
+        fetcher = {
+            SPOT:  "get_exchange_info",
+            USDM:  "futures_exchange_info",
+            COINM: "futures_coin_exchange_info",
+        }[segment]
+        try:
+            with self.api_lock:
+                info = getattr(self._client, fetcher)()
+            cache: dict[str, dict] = {}
+            for sym in info.get("symbols", []):
+                cache[sym["symbol"].upper()] = sym
+            self._symbol_cache[segment] = cache
+            self._last_symbol_update[segment] = time.time()
+            logger.info(
+                "BinanceSession[%s] cached %d %s symbols",
+                self.alias, len(cache), segment,
+            )
+        except Exception as exc:
+            logger.warning(
+                "BinanceSession[%s] load_symbols(%s) failed: %s",
+                self.alias, segment, exc,
+            )
+
+    def symbol_info(self, symbol: str, segment: str = SPOT) -> dict | None:
+        """Return cached exchange-info row for ``symbol`` in ``segment``."""
+        return self._symbol_cache.get(segment, {}).get(symbol.upper())
+
+    def active_symbols(
+        self, segment: str = SPOT, quote_asset: str = "USDT"
+    ) -> list[str]:
+        """Return trading-active symbols in ``segment`` with the given quote."""
+        out: list[str] = []
+        for sym, info in self._symbol_cache.get(segment, {}).items():
+            status = info.get("status") or info.get("contractStatus")
+            if status != "TRADING":
+                continue
+            if quote_asset and info.get("quoteAsset") != quote_asset:
+                continue
+            out.append(sym)
+        return out
+
+    # ── Precision ────────────────────────────────────────────────────
+    def round_quantity(
+        self, symbol: str, qty: float, segment: str = SPOT
+    ) -> float:
+        """Round ``qty`` down to the segment's LOT_SIZE step."""
+        info = self.symbol_info(symbol, segment)
+        if not info:
+            return qty
+        for f in info.get("filters", []):
+            if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+                return self._round_step(qty, float(f["stepSize"]))
+        return qty
+
+    def round_price(
+        self, symbol: str, price: float, segment: str = SPOT
+    ) -> float:
+        """Round ``price`` down to the segment's PRICE_FILTER tick."""
+        info = self.symbol_info(symbol, segment)
+        if not info:
+            return price
+        for f in info.get("filters", []):
+            if f.get("filterType") == "PRICE_FILTER":
+                return self._round_step(price, float(f["tickSize"]))
+        return price
+
+    # ── Realtime ─────────────────────────────────────────────────────
+    def create_ws_manager(self) -> object | None:
+        """Return a fresh ``BinanceSocketManager`` for spot ticker streams."""
+        if self._client is None or not BINANCE_AVAILABLE:
+            return None
+        return BinanceSocketManager(self._client)  # type: ignore[misc]
+
+    # ── User-data-stream push channel (V3 §F7) ───────────────────────
+    def register_user_event_handler(
+        self, handler: Callable[[dict], None] | None
+    ) -> None:
+        """Register a parser for Binance user-data-stream events.
+
+        Called by the exec plugin at configure(). The WS lifecycle owner
+        feeds events via :meth:`dispatch_user_event`. Pass ``None`` to clear.
+        """
+        self._user_event_handler = handler
+
+    def dispatch_user_event(self, event: dict) -> None:
+        """Forward a Binance user-data event to the registered handler.
+
+        Catches handler errors so a buggy parser cannot kill the WS reactor.
+        """
+        handler = self._user_event_handler
+        if handler is None:
+            return
+        try:
+            handler(event)
+        except Exception as exc:
+            logger.exception(
+                "BinanceSession[%s] user-event handler raised: %s",
+                self.alias, exc,
+            )
+
+    # ── Internals ────────────────────────────────────────────────────
+    def _dispose(self) -> None:
+        """Drop the client + caches (called by session_registry on eviction)."""
+        self._client = None
+        self._configured = False
+        self._authenticated = False
+        for seg in SUPPORTED_SEGMENTS:
+            self._symbol_cache[seg].clear()
+            self._last_symbol_update[seg] = 0.0
+
+    @staticmethod
+    def _round_step(value: float, step: float) -> float:
+        """Round ``value`` down to the nearest multiple of ``step``.
+
+        Decimal places are inferred from ``step`` (``0.001 → 3``) so the
+        float returned doesn't carry binary-rounding artefacts. Matches v1
+        behaviour.
+        """
+        if step <= 0:
+            return value
+        step_str = format(step, "f").rstrip("0")
+        precision = len(step_str.split(".")[-1]) if "." in step_str else 0
+        rounded = math.floor(value / step + 1e-10) * step
+        return round(rounded, precision)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Trading-holiday baseline (V3 §F5) — empty by design
+# ══════════════════════════════════════════════════════════════════════
+# Binance spot, USD-M futures and COIN-M futures all trade 24/7/365.
+# No regular weekly close, no civil/religious holiday on which the
+# venue stops accepting orders. User-managed maintenance windows merge
+# in via ``~/.opentrader-pro/holidays/binance.json`` — see
+# :mod:`opentrader.services.holiday_service`.
+BINANCE_24_7: tuple[date, ...] = ()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Fees (V3 §F2) — flat taker rates per segment
+# ══════════════════════════════════════════════════════════════════════
+# Taker is the worst-case rate on the standard retail tier; using it
+# universally means we never under-report fees on the journal's net P&L.
+# When the V3 §F7 push channel feeds broker-supplied commission into a
+# TradeFill, this approximation can be swapped for the exact maker/taker
+# amount per fill.
+_TAKER_SPOT      = 0.0010        # 0.10 %
+_TAKER_USDM_FUT  = 0.0004        # 0.040 %
+_TAKER_COINM_FUT = 0.0005        # 0.050 %
+
+_FEES_CCY = "USDT"
+
+
+def _fees_round8(x: float) -> float:
+    """Crypto-friendly 8-decimal rounding — preserves satoshi-level
+    precision when a fill leg is tiny (sub-1 USDT trades on testnet)."""
+    return round(x, 8)
+
+
+def _fees_zero() -> Fees:
+    return Fees.zero(currency=_FEES_CCY)
+
+
+def compute_binance_fees(trade: TradeFill) -> Fees:
+    """Compute :class:`Fees` for one Binance fill.
+
+    Returns ``Fees.zero(currency='USDT')`` for any fill with non-positive
+    turnover or a segment Binance doesn't trade.
+    """
+    qty = float(trade.quantity or 0.0)
+    price = float(trade.price or 0.0)
+    if qty <= 0 or price <= 0.0:
+        return _fees_zero()
+
+    notional = qty * price
+    seg_u = (trade.segment or "").upper()
+
+    if seg_u in ("SPOT", "CRYPTO_SPOT"):
+        rate = _TAKER_SPOT
+    elif seg_u == "USDM_FUTURES":
+        rate = _TAKER_USDM_FUT
+    elif seg_u == "COINM_FUTURES":
+        rate = _TAKER_COINM_FUT
+    else:
+        return _fees_zero()
+
+    fee = _fees_round8(notional * rate)
+    # Binance bills as a single brokerage line; no separate exchange or
+    # tax components in the retail schedule we model here.
+    return Fees(
+        brokerage=fee,
+        exchange_charges=0.0,
+        taxes={},
+        currency=_FEES_CCY,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Errors taxonomy (V3 §F9) — Binance SDK → BrokerError
+# ══════════════════════════════════════════════════════════════════════
+# Binance error-code taxonomy. Authoritative codes from
+# binance-docs/Errors.md (spot + futures share the bulk of the
+# negative-code space). Grouped by V3 class so adding a new code is a
+# single tuple-edit.
+_AUTH_CODES: frozenset[int] = frozenset({
+    -1022,   # SIGNATURE invalid
+    -2014,   # API-key format invalid
+    -2015,   # Invalid API-key, IP, or permissions for action
+    -1099,   # Not found, authenticated, or authorized (margin/futures)
+    -1125,   # listenKey not found
+    -2008,   # Invalid Api-Key ID (futures)
+    -2009,   # Invalid api key (futures)
+    -4083,   # Invalid Api-Key (futures positions)
+})
+_RATE_LIMIT_CODES: frozenset[int] = frozenset({
+    -1003,   # TOO_MANY_REQUESTS
+    -1015,   # TOO_MANY_ORDERS (24h)
+    -1429,   # Way too many requests (futures)
+})
+_INSUFFICIENT_FUNDS_CODES: frozenset[int] = frozenset({
+    -2018,   # Balance is insufficient (margin)
+    -2019,   # Margin is insufficient (futures)
+    -3041,   # Balance is not enough (margin loan)
+})
+_INVALID_ORDER_CODES: frozenset[int] = frozenset({
+    -1013,   # INVALID_QUANTITY / filter failure (LOT_SIZE, PRICE_FILTER, etc.)
+    -1100,   # Illegal characters found in parameter
+    -1101,   # Too many parameters
+    -1102,   # Mandatory parameter was not sent / empty
+    -1106,   # Parameter not required
+    -1111,   # Precision is over the maximum defined
+    -1116,   # Invalid orderType
+    -1117,   # Invalid side
+    -1120,   # Invalid interval
+    -1121,   # Invalid symbol
+    -1130,   # Invalid data sent for a parameter
+    -2011,   # CANCEL_REJECTED (e.g. unknown order)
+    -4003,   # Quantity less than zero (futures)
+    -4004,   # Quantity less than min quantity (futures)
+    -4005,   # Quantity greater than max quantity (futures)
+})
+_TRANSIENT_CODES: frozenset[int] = frozenset({
+    -1000,   # UNKNOWN — server-side transient
+    -1001,   # DISCONNECTED
+    -1006,   # UNEXPECTED_RESP
+    -1007,   # TIMEOUT
+    -1016,   # SERVICE_SHUTTING_DOWN
+    -1021,   # Timestamp for this request is outside of the recvWindow
+})
+
+# HTTP-level fallbacks (when ``code`` is missing — pre-API errors / proxies).
+_RATE_LIMIT_STATUSES: frozenset[int] = frozenset({429, 418})
+_AUTH_STATUSES: frozenset[int] = frozenset({401, 403})
+_TRANSIENT_STATUSES: frozenset[int] = frozenset({408, 500, 502, 503, 504})
+
+# Message-hint fallback (used only when neither code nor status helps).
+_INSUFFICIENT_FUNDS_HINTS: tuple[str, ...] = (
+    "insufficient balance", "insufficient funds", "balance is insufficient",
+    "margin is insufficient",
+)
+_RATE_LIMIT_HINTS: tuple[str, ...] = (
+    "too many requests", "rate limit", "throttle", "way too many", "429",
+)
+
+
+def classify_binance_exception(exc: BaseException) -> BrokerError:
+    """Translate a vendor exception into the V3 broker-error taxonomy.
+
+    Resolution order:
+
+    1. **BinanceAPIException by ``.code``** — covers ~95% of broker-side
+       failures with stable, documented error codes (e.g. ``-1003`` →
+       :class:`RateLimitError`, ``-2019`` →
+       :class:`InsufficientFundsError`, ``-2015`` →
+       :class:`AuthError`).
+    2. **BinanceAPIException by ``.status_code``** — fallback when the
+       JSON body is malformed (HTTP 429 / 418 still mean rate-limit even
+       if the response wasn't parseable).
+    3. **BinanceRequestException** — pre-flight validation failures from
+       the SDK; map to :class:`InvalidOrderError`.
+    4. **Generic transport errors** (``TimeoutError`` /
+       ``ConnectionError`` / ``OSError``) → :class:`TransientError`.
+    5. **Message-hint fallback** for anything that didn't match — last
+       resort before defaulting.
+    6. **Default**: :class:`BrokerRejectError` so the failure surfaces
+       to the journal & UI with the original message intact.
+
+    The helper always returns an instance — never ``None`` — so callers
+    can ``raise classify_binance_exception(exc) from exc`` without a
+    further None-check.
+    """
+    msg = str(exc) if exc.args else exc.__class__.__name__
+    low = msg.lower()
+
+    # 1./2. Lazy import — module-load must not fail without python-binance.
+    try:
+        from binance import exceptions as bex  # type: ignore[import-not-found]
+    except ImportError:
+        bex = None  # type: ignore[assignment]
+
+    if bex is not None:
+        api_cls = getattr(bex, "BinanceAPIException", None)
+        if api_cls is not None and isinstance(exc, api_cls):
+            code = getattr(exc, "code", None)
+            status = getattr(exc, "status_code", None)
+            if isinstance(code, int):
+                if code in _AUTH_CODES:
+                    return AuthError(msg)
+                if code in _RATE_LIMIT_CODES:
+                    return RateLimitError(msg)
+                if code in _INSUFFICIENT_FUNDS_CODES:
+                    return InsufficientFundsError(msg)
+                if code in _INVALID_ORDER_CODES:
+                    return InvalidOrderError(msg)
+                if code in _TRANSIENT_CODES:
+                    return TransientError(msg)
+            if isinstance(status, int):
+                if status in _RATE_LIMIT_STATUSES:
+                    return RateLimitError(msg)
+                if status in _AUTH_STATUSES:
+                    return AuthError(msg)
+                if status in _TRANSIENT_STATUSES:
+                    return TransientError(msg)
+            return BrokerRejectError(msg)
+
+        # 3. SDK-side validation (bad params before request leaves client).
+        req_cls = getattr(bex, "BinanceRequestException", None)
+        if req_cls is not None and isinstance(exc, req_cls):
+            return InvalidOrderError(msg)
+
+        # SDK order-precondition errors (e.g. min amount / min price).
+        order_cls = getattr(bex, "BinanceOrderException", None)
+        if order_cls is not None and isinstance(exc, order_cls):
+            return InvalidOrderError(msg)
+
+    # 4. Transport-level errors.
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return TransientError(msg)
+    if isinstance(exc, OSError):
+        return TransientError(msg)
+
+    # 5. Message-hint fallback.
+    if any(h in low for h in _RATE_LIMIT_HINTS):
+        return RateLimitError(msg)
+    if any(h in low for h in _INSUFFICIENT_FUNDS_HINTS):
+        return InsufficientFundsError(msg)
+
+    # 6. Default — broker said no, reason unclassified.
+    return BrokerRejectError(msg)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# User-data-stream worker (V3 §F7)
+# ══════════════════════════════════════════════════════════════════════
+# Worker-local segment identifiers — short lowercase tokens that keep the
+# REST-method-name maps below readable. Renamed with the ``_WORKER_``
+# prefix so they don't collide with the public ``SUPPORTED_SEGMENTS``
+# tuple above (which carries the ``CRYPTO_SPOT`` / ``USDM_FUTURES`` / …
+# values used by ``CAPABILITIES.segments``).
+_WORKER_SEG_SPOT = "spot"
+_WORKER_SEG_USDM = "usdm"
+_WORKER_SEG_COINM = "coinm"
+_WORKER_SUPPORTED_SEGMENTS: tuple[str, ...] = (
+    _WORKER_SEG_SPOT, _WORKER_SEG_USDM, _WORKER_SEG_COINM,
+)
+
+
+class _StreamHandle(Protocol):
+    """Minimum surface a connector returns — three methods, no Qt."""
+
+    def start(self) -> None: ...                      # pragma: no cover
+    def stop(self) -> None: ...                       # pragma: no cover
+    def is_alive(self) -> bool: ...                   # pragma: no cover
+
+
+Connector = Callable[
+    [object, str, Callable[[dict], None]], _StreamHandle
+]
+"""Signature: ``connector(client, listen_key, on_message) -> handle``.
+
+Production wiring is a thin adapter over python-binance's
+``ThreadedWebsocketManager`` (chosen because it survives the asyncio /
+sync API split between python-binance versions — the threaded API has
+been stable across the version range we target). Tests inject a fake
+that captures messages and exposes lifecycle assertions.
+"""
+
+
+def _default_connector(
+    client: object, listen_key: str, on_message: Callable[[dict], None]
+) -> _StreamHandle:
+    """Adapter over python-binance's ``ThreadedWebsocketManager``.
+
+    Lazy-imports so the rest of the worker remains testable in
+    environments without python-binance installed. Failures here raise
+    :class:`RuntimeError` so the worker's reconnect loop logs and
+    backs off instead of crashing.
+    """
+    try:
+        from binance import ThreadedWebsocketManager       # type: ignore
+    except ImportError as exc:                             # pragma: no cover
+        raise RuntimeError(
+            "python-binance is not installed; user-data WS unavailable."
+        ) from exc
+
+    twm = ThreadedWebsocketManager(api_key="", api_secret="")
+    twm.start()
+    twm.start_user_socket(callback=on_message, listen_key=listen_key)
+
+    class _TwmHandle:
+        __slots__ = ("_twm",)
+
+        def __init__(self, twm_inst: object) -> None:
+            self._twm = twm_inst
+
+        def start(self) -> None:
+            # Already started above — connector eagerly opens the socket.
+            return
+
+        def stop(self) -> None:
+            try:
+                self._twm.stop()  # type: ignore[attr-defined]
+            except Exception as exc:                       # pragma: no cover
+                logger.warning("ThreadedWebsocketManager.stop raised: %s", exc)
+
+        def is_alive(self) -> bool:
+            attr = getattr(self._twm, "is_alive", None)
+            if callable(attr):
+                try:
+                    return bool(attr())
+                except Exception:                          # pragma: no cover
+                    return False
+            return True
+
+    return _TwmHandle(twm)
+
+
+# REST method names on the python-binance ``Client`` per worker-segment.
+# Unified in one map so a future SDK rename is a single-source-of-truth fix.
+_LISTEN_KEY_GET: dict[str, str] = {
+    _WORKER_SEG_SPOT: "stream_get_listen_key",
+    _WORKER_SEG_USDM: "futures_stream_get_listen_key",
+    _WORKER_SEG_COINM: "futures_coin_stream_get_listen_key",
+}
+_LISTEN_KEY_KEEPALIVE: dict[str, str] = {
+    _WORKER_SEG_SPOT: "stream_keepalive",
+    _WORKER_SEG_USDM: "futures_stream_keepalive",
+    _WORKER_SEG_COINM: "futures_coin_stream_keepalive",
+}
+_LISTEN_KEY_CLOSE: dict[str, str] = {
+    _WORKER_SEG_SPOT: "stream_close",
+    _WORKER_SEG_USDM: "futures_stream_close",
+    _WORKER_SEG_COINM: "futures_coin_stream_close",
+}
+
+
+class BinanceUserDataWorker:
+    """Background lifecycle owner for one Binance user-data WebSocket.
+
+    Construct via :meth:`for_session` for the common case where the
+    :class:`BinanceSession` already has a configured ``client``.
+
+    Lifecycle:
+
+    1. :meth:`start` spawns a daemon thread that runs :meth:`_run`.
+    2. ``_run`` provisions a listen-key, opens the WS via the connector,
+       and enters a wait loop that wakes up periodically to renew the
+       listen-key (every :attr:`KEEPALIVE_INTERVAL_S`, broker-recommended
+       at 30 min) and to detect dropped sockets.
+    3. On WS close (without :meth:`stop` being called), the loop sleeps
+       for an exponential backoff (capped) and reconnects from step 1.
+    4. :meth:`stop` signals the thread to exit, closes the WS handle,
+       and best-effort closes the listen-key on the broker side.
+
+    Thread safety:
+
+    * :meth:`start` and :meth:`stop` are idempotent — repeated calls are
+      safe and inexpensive.
+    * The ``_handle`` and ``_listen_key`` attributes are guarded by
+      :attr:`_lock` so the supervisor thread and the foreground caller
+      cannot tear each other apart.
+    """
+
+    # Binance documents user-data listen-keys as expiring after 60 minutes
+    # of no keepalive PUT. Renewing every 30 minutes leaves a full window
+    # of safety margin for clock skew and transient network failures.
+    KEEPALIVE_INTERVAL_S: float = 30 * 60.0
+
+    # Wake the supervisor thread every 30 s to check whether keepalive is
+    # due or the socket has dropped. Anything finer wastes CPU; coarser
+    # delays the keepalive PUT past the 30-min mark in pathological cases.
+    SUPERVISOR_TICK_S: float = 30.0
+
+    # Reconnect backoff: start at 1 s, double each failure, cap at 60 s.
+    RECONNECT_INITIAL_BACKOFF_S: float = 1.0
+    RECONNECT_MAX_BACKOFF_S: float = 60.0
+
+    # Connections that ran at least this long are considered "stable" — a
+    # subsequent close resets the reconnect backoff to its initial value
+    # so a drop after hours of uptime doesn't begin retrying at the
+    # 60-second cap accumulated during an earlier outage.
+    STABLE_UPTIME_S: float = 60.0
+
+    @classmethod
+    def for_session(
+        cls,
+        session: object,
+        *,
+        segment: str = _WORKER_SEG_SPOT,
+        connector: Connector | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> "BinanceUserDataWorker":
+        """Convenience constructor — preferred over calling ``__init__``."""
+        return cls(
+            session=session,
+            segment=segment,
+            connector=connector,
+            clock=clock,
+        )
+
+    def __init__(
+        self,
+        *,
+        session: object,
+        segment: str = _WORKER_SEG_SPOT,
+        connector: Connector | None = None,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        if segment not in _WORKER_SUPPORTED_SEGMENTS:
+            raise ValueError(
+                f"unsupported segment {segment!r}; "
+                f"expected one of {_WORKER_SUPPORTED_SEGMENTS!r}"
+            )
+        self._session = session
+        self._segment = segment
+        self._connector: Connector = connector or _default_connector
+        self._clock = clock or time.monotonic
+
+        self._lock = threading.Lock()
+        self._stopped = threading.Event()
+        self._stopped.set()                        # not running until start()
+        self._thread: threading.Thread | None = None
+        self._listen_key: str | None = None
+        self._handle: _StreamHandle | None = None
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+    def start(self) -> None:
+        """Spawn the supervisor thread. Idempotent."""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stopped.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name=f"binance-userdata-{self._segment}-{self._alias()}",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Signal exit, tear down the WS, dispose the listen-key, join.
+
+        Idempotent. ``timeout`` caps the join wait — set high enough that
+        a slow connector teardown completes, low enough to avoid blocking
+        application shutdown indefinitely if the network has wedged.
+        """
+        with self._lock:
+            already_stopped = self._stopped.is_set() and self._thread is None
+            if already_stopped:
+                return
+            self._stopped.set()
+            handle = self._handle
+            listen_key = self._listen_key
+            thread = self._thread
+
+        if handle is not None:
+            try:
+                handle.stop()
+            except Exception as exc:                       # noqa: BLE001
+                logger.warning("WS handle.stop raised: %s", exc)
+
+        if listen_key is not None:
+            self._dispose_listen_key(listen_key)
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+        with self._lock:
+            self._thread = None
+            self._handle = None
+            self._listen_key = None
+
+    @property
+    def is_running(self) -> bool:
+        """True between :meth:`start` and :meth:`stop`."""
+        with self._lock:
+            return (
+                self._thread is not None and self._thread.is_alive()
+                and not self._stopped.is_set()
+            )
+
+    # ── Supervisor loop ──────────────────────────────────────────────────
+    def _run(self) -> None:
+        """Reconnect-and-keepalive loop. Owns the worker thread."""
+        backoff = self.RECONNECT_INITIAL_BACKOFF_S
+        while not self._stopped.is_set():
+            try:
+                uptime = self._connect_and_serve()
+                if self._stopped.is_set():
+                    return
+                if uptime >= self.STABLE_UPTIME_S:
+                    backoff = self.RECONNECT_INITIAL_BACKOFF_S
+                backoff = self._sleep_with_backoff(backoff, "WS closed")
+            except Exception as exc:                       # noqa: BLE001
+                logger.warning(
+                    "BinanceUserDataWorker[%s/%s] cycle raised %s — "
+                    "reconnecting after %.1fs",
+                    self._alias(), self._segment, exc, backoff,
+                )
+                if self._stopped.is_set():
+                    return
+                backoff = self._sleep_with_backoff(backoff, str(exc))
+
+    def _connect_and_serve(self) -> float:
+        """One provisioning → serve → close cycle.
+
+        Returns the elapsed uptime (seconds) the WS handle reported as
+        alive — used by :meth:`_run` to decide whether the connection
+        was stable enough to reset the reconnect backoff.
+        """
+        listen_key = self._provision_listen_key()
+        # ``_provision_listen_key`` already stored the key on ``self`` so
+        # ``stop()`` can dispose it as soon as the REST call returned —
+        # this redundant write keeps the cycle's local view consistent
+        # if a future refactor changes the provisioning helper.
+        with self._lock:
+            self._listen_key = listen_key
+
+        on_message = self._on_ws_message
+        client = getattr(self._session, "client", None)
+        if client is None:
+            raise RuntimeError("BinanceSession has no configured client")
+
+        handle = self._connector(client, listen_key, on_message)
+        with self._lock:
+            self._handle = handle
+        try:
+            handle.start()
+        except Exception:
+            with self._lock:
+                self._handle = None
+            raise
+
+        last_keepalive = self._clock()
+        connected_at = self._clock()
+        try:
+            while not self._stopped.is_set() and self._handle_alive():
+                if self._clock() - last_keepalive >= self.KEEPALIVE_INTERVAL_S:
+                    self._renew_listen_key(listen_key)
+                    last_keepalive = self._clock()
+                self._stopped.wait(timeout=self.SUPERVISOR_TICK_S)
+        finally:
+            with self._lock:
+                current = self._handle
+                self._handle = None
+            if current is not None:
+                try:
+                    current.stop()
+                except Exception as exc:                   # noqa: BLE001
+                    logger.warning("WS handle.stop on cycle exit raised: %s", exc)
+        return max(0.0, self._clock() - connected_at)
+
+    def _handle_alive(self) -> bool:
+        with self._lock:
+            handle = self._handle
+        if handle is None:
+            return False
+        try:
+            return bool(handle.is_alive())
+        except Exception:                                  # noqa: BLE001
+            return False
+
+    def _sleep_with_backoff(self, current: float, reason: str) -> float:
+        """Sleep ``current`` seconds (interruptible by stop), return next backoff."""
+        logger.info(
+            "BinanceUserDataWorker[%s/%s] reconnect in %.1fs (%s)",
+            self._alias(), self._segment, current, reason,
+        )
+        self._stopped.wait(timeout=current)
+        return min(current * 2.0, self.RECONNECT_MAX_BACKOFF_S)
+
+    # ── REST helpers ─────────────────────────────────────────────────────
+    def _provision_listen_key(self) -> str:
+        client = getattr(self._session, "client", None)
+        if client is None:
+            raise RuntimeError("BinanceSession has no configured client")
+        method_name = _LISTEN_KEY_GET[self._segment]
+        method = getattr(client, method_name, None)
+        if method is None:
+            raise RuntimeError(
+                f"python-binance Client missing {method_name!r}; "
+                f"SDK version may be unsupported."
+            )
+        listen_key = method()
+        if not isinstance(listen_key, str) or not listen_key:
+            raise RuntimeError(
+                f"{method_name} returned non-string listen-key: {listen_key!r}"
+            )
+        # Store on ``self`` *before* returning so a concurrent ``stop()``
+        # call sees the listen-key and can dispose it on the broker side.
+        # Polling for the call counter and then immediately calling
+        # ``stop()`` would otherwise race the supervisor thread that
+        # hasn't yet executed the cycle's own assignment.
+        with self._lock:
+            self._listen_key = listen_key
+        return listen_key
+
+    def _renew_listen_key(self, listen_key: str) -> None:
+        client = getattr(self._session, "client", None)
+        if client is None:
+            return
+        method_name = _LISTEN_KEY_KEEPALIVE[self._segment]
+        method = getattr(client, method_name, None)
+        if method is None:
+            logger.warning(
+                "Client missing %s; skipping keepalive (listen-key may "
+                "expire after 60 min).",
+                method_name,
+            )
+            return
+        try:
+            # python-binance accepts both kwarg and positional forms across
+            # versions — try the kwarg form first (the documented one) and
+            # fall back so older builds keep working.
+            try:
+                method(listenKey=listen_key)
+            except TypeError:
+                method(listen_key)
+        except Exception as exc:                           # noqa: BLE001
+            # A keepalive failure is non-fatal: the WS may still be live;
+            # the next cycle reconnects and provisions a fresh key.
+            logger.warning(
+                "Listen-key keepalive raised %s — will reconnect on next drop.",
+                exc,
+            )
+
+    def _dispose_listen_key(self, listen_key: str) -> None:
+        client = getattr(self._session, "client", None)
+        if client is None:
+            return
+        method_name = _LISTEN_KEY_CLOSE[self._segment]
+        method = getattr(client, method_name, None)
+        if method is None:
+            return
+        try:
+            try:
+                method(listenKey=listen_key)
+            except TypeError:
+                method(listen_key)
+        except Exception as exc:                           # noqa: BLE001
+            logger.debug(
+                "Listen-key close raised %s — server-side TTL will reclaim.",
+                exc,
+            )
+
+    # ── Event fan-out ────────────────────────────────────────────────────
+    def _on_ws_message(self, payload: object) -> None:
+        """Forward one raw frame to the session's parser bridge.
+
+        Accepts ``object`` so a connector that hands us non-dict frames
+        (e.g. python-binance's heartbeat noise) doesn't blow up the
+        reactor — non-dict frames are silently dropped because the
+        downstream parser only knows the dict shape Binance documents.
+        """
+        if not isinstance(payload, dict):
+            return
+        try:
+            dispatch = getattr(self._session, "dispatch_user_event", None)
+            if dispatch is not None:
+                dispatch(payload)
+        except Exception as exc:                           # noqa: BLE001
+            # The session's dispatch already wraps handler errors; this
+            # outer guard is a belt-and-braces layer for cases where
+            # dispatch itself fails (e.g. teardown race).
+            logger.warning("session.dispatch_user_event raised: %s", exc)
+
+    # ── Diagnostics ──────────────────────────────────────────────────────
+    def _alias(self) -> str:
+        return getattr(self._session, "alias", "unknown")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Per-call SOCKS5 proxy scope (V3 §N3)
+# ══════════════════════════════════════════════════════════════════════
+@contextmanager
+def _proxy_scope(client: Any, proxy_url: str | None) -> Iterator[None]:
+    """Temporarily route ``client``'s HTTP traffic through ``proxy_url``.
+
+    python-binance's ``Client`` wraps a ``requests.Session`` exposed at
+    ``client.session``; mutating ``session.proxies`` is the standard way
+    to apply a per-call proxy without rebuilding the Client. We snapshot
+    the prior ``proxies`` dict on entry and restore it on exit so query
+    methods that run between routed order calls see the original (empty)
+    proxy state.
+
+    A ``proxy_url`` of ``None`` is a deliberate no-op — the live resolver
+    in :class:`RoutedSession` returns ``None`` when the SOCKS5 tunnel is
+    down, and the contract is "fall back to direct" rather than block.
+    The scope also no-ops when the client has no ``session`` attribute
+    (e.g. test doubles): the routing is best-effort and the order itself
+    must still succeed in the dev path.
+    """
+    if proxy_url is None:
+        yield
+        return
+    session = getattr(client, "session", None)
+    if session is None:
+        yield
+        return
+    prior = dict(getattr(session, "proxies", {}) or {})
+    try:
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        yield
+    finally:
+        session.proxies = prior
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Per-segment method maps + status maps
+# ══════════════════════════════════════════════════════════════════════
+# Each entry is: place / cancel / open_orders / positions method name on
+# the python-binance ``Client``. Spot has no "positions" endpoint — we
+# synthesise from balances in ``get_positions``.
+_METHODS: dict[str, dict[str, str]] = {
+    SPOT: {
+        "place":       "create_order",
+        "cancel":      "cancel_order",
+        "open_orders": "get_open_orders",
+    },
+    USDM: {
+        "place":       "futures_create_order",
+        "cancel":      "futures_cancel_order",
+        "open_orders": "futures_get_open_orders",
+        "positions":   "futures_position_information",
+        "account":     "futures_account",
+    },
+    COINM: {
+        "place":       "futures_coin_create_order",
+        "cancel":      "futures_coin_cancel_order",
+        "open_orders": "futures_coin_get_open_orders",
+        "positions":   "futures_coin_position_information",
+        "account":     "futures_coin_account_balance",
+    },
+}
+
+
+# ── Order-type maps (per-segment where it differs) ─────────────────────
+_SPOT_ORDER_TYPE: dict[str, str] = {
+    "MARKET": "MARKET",
+    "LIMIT":  "LIMIT",
+    "SL":     "STOP_LOSS_LIMIT",
+    "SL-M":   "STOP_LOSS",
+}
+_FUT_ORDER_TYPE: dict[str, str] = {
+    "MARKET": "MARKET",
+    "LIMIT":  "LIMIT",
+    "SL":     "STOP",
+    "SL-M":   "STOP_MARKET",
+}
+
+_STATUS_MAP: dict[str, str] = {
+    "NEW":              "PENDING",
+    "PARTIALLY_FILLED": "PARTIAL",
+    "FILLED":           "COMPLETE",
+    "CANCELED":         "CANCELLED",
+    "CANCELLED":        "CANCELLED",
+    "PENDING_CANCEL":   "PENDING",
+    "REJECTED":         "REJECTED",
+    "EXPIRED":          "CANCELLED",
+}
+
+
+# Binance native status → V3 ExecReportType (V3 §F7).
+_BINANCE_STATUS_TO_EXEC_TYPE: dict[str, str] = {
+    "NEW":              "NEW",
+    "PARTIALLY_FILLED": "PARTIAL_FILL",
+    "FILLED":           "FILL",
+    "CANCELED":         "CANCELED",
+    "CANCELLED":        "CANCELED",
+    "REJECTED":         "REJECTED",
+    "EXPIRED":          "EXPIRED",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ExecPlugin
+# ══════════════════════════════════════════════════════════════════════
+class ExecPlugin(ExecPluginV2):
+    """Binance order execution — one instance per alias."""
+
+    INFO: ClassVar[PluginInfo] = PluginInfo(
+        name="binance",
+        display_name="Binance",
+        version="2.0.0",
+        author="OpenTrader",
+        min_app_api="2.0",
+        description=(
+            "Order execution for Binance spot + USD-M + COIN-M futures "
+            "with segment-routed placement and cancellation."
+        ),
+    )
+    CREDENTIAL_SCHEMA: ClassVar[tuple[CredentialField, ...]] = (
+        CredentialField("api_key",    "API Key",    "text"),
+        CredentialField("api_secret", "API Secret", "password"),
+        CredentialField(
+            "testnet", "Use Testnet", "checkbox", required=False,
+            help_text="Route all order calls to Binance testnet.",
+        ),
+    )
+    # Binance enforces an account-level cap of 50 orders / 10s on spot
+    # (https://binance-docs.github.io/apidocs/spot/en/#limits) and a more
+    # generous 2400/min on USD-M futures. We declare the tightest bucket
+    # so the RetryQueue stays safe for the worst-case venue; users running
+    # futures-only setups can override at deployment time.
+    #
+    # V3 §N1 — Order-mutating methods declare static-IP routing because
+    # most jurisdictions either require or strongly recommend a fixed
+    # egress IP for live trading API access (regulator sub-account
+    # allowlists, withdrawal-key allowlist policies, anti-DDoS rules).
+    # Query / market-data methods stay direct — they're public-data
+    # endpoints and there's no compliance benefit to routing them.
+    CAPABILITIES: ClassVar[ExecCapabilities] = ExecCapabilities(
+        segments=SUPPORTED_SEGMENTS,
+        product_types=("NRML",),
+        order_types=("MARKET", "LIMIT", "SL", "SL-M"),
+        async_execution_reports=True,
+        rate_limits=RateLimits(buckets=(
+            RateLimit(max_units=50, window_seconds=10.0, category="orders"),
+        )),
+        static_ip_required_for=frozenset({
+            "place_order", "cancel_order", "modify_order",
+        }),
+        exchange_to_segment=MappingProxyType({
+            "BINANCE": SPOT,
+            "CRYPTO": SPOT,
+        }),
+    )
+
+    # ── Construction ─────────────────────────────────────────────────
+    def __init__(self, alias: str) -> None:
+        super().__init__(alias)
+        self._session: BinanceSession = session_registry.get_or_create_session(
+            namespace=self.INFO.name, alias=alias, factory=BinanceSession,
+        )
+        self._configured = False
+        # order_id → (segment, symbol) for cancel/modify bookkeeping.
+        self._order_meta: dict[str, tuple[str, str]] = {}
+        # V3 §F7 — user-data-stream lifecycle. Started lazily on first
+        # successful ``authenticate()`` so account-rehydration without a
+        # live client (e.g. ``load_from_disk`` before ``authenticate``)
+        # doesn't try to open a WS. Tests can inject a custom worker
+        # factory via ``self._user_data_worker_factory`` before
+        # ``authenticate()`` is called; production leaves it None and
+        # ``_maybe_start_user_data_worker`` builds a default worker.
+        self._user_data_worker: BinanceUserDataWorker | None = None
+        self._user_data_worker_factory: (
+            "Callable[[BinanceSession], BinanceUserDataWorker] | None"
+        ) = None
+        # V3 §N3 routing bundle — populated in configure(); place_order
+        # and cancel_order read self._routing.routed.proxy_url per call.
+        self._routing: SessionRouting | None = None
+
+    # ── Lifecycle ────────────────────────────────────────────────────
+    def configure(
+        self,
+        credentials: dict[str, str],
+        *,
+        routing: SessionRouting | None = None,
+    ) -> None:
+        if not BINANCE_AVAILABLE:
+            raise RuntimeError(
+                "python-binance not installed. Run: pip install python-binance"
+            )
+        api_key = credentials.get("api_key", "")
+        api_secret = credentials.get("api_secret", "")
+        if not api_key or not api_secret:
+            raise ValueError("api_key and api_secret are required")
+        testnet = _coerce_bool(credentials.get("testnet", False))
+        if not self._session.is_configured:
+            ok = self._session.configure(api_key, api_secret, testnet)
+            if not ok:
+                raise RuntimeError("BinanceSession.configure() failed")
+        # Wire the user-data-stream push channel (V3 §F7). The WS lifecycle
+        # owner (BinanceUserDataWorker, started in authenticate()) feeds
+        # events into the parser via the shared session — polling stays
+        # as fallback.
+        self._session.register_user_event_handler(self._on_binance_user_event)
+        # V3 §N3 — stash the routing bundle so place_order / cancel_order
+        # can mutate ``client.session.proxies`` per call via
+        # :func:`_proxy_scope`. Live resolver pattern: ``routed.proxy_url``
+        # is re-evaluated per access so a tunnel drop degrades the next
+        # order to direct without plugin reconfiguration. Query methods
+        # stay direct — N1 declared only the order-mutating set.
+        self._routing = routing
+        self._configured = True
+
+    def authenticate(self) -> AuthResult:
+        if not BINANCE_AVAILABLE:
+            return AuthResult(ok=False, error="python-binance not installed")
+        if not self._configured:
+            return AuthResult(ok=False, error="not configured")
+        if self._session.is_authenticated:
+            self._authenticated = True
+            self._maybe_start_user_data_worker()
+            return AuthResult(ok=True)
+        ok, msg = self._session.authenticate()
+        if ok:
+            self._authenticated = True
+            # Pre-load every segment's exchange info so place_order's
+            # precision rounding is correct immediately after login.
+            for seg in SUPPORTED_SEGMENTS:
+                self._session.load_symbols(seg)
+            # V3 §F7 — kick off the user-data-stream worker. Polling
+            # fallback (OrderTracker) keeps populating the journal if
+            # the worker can't establish, so this is a latency-shaving
+            # add-on rather than a correctness gate.
+            self._maybe_start_user_data_worker()
+        return AuthResult(ok=ok, error="" if ok else msg)
+
+    def _maybe_start_user_data_worker(self) -> None:
+        """Start a :class:`BinanceUserDataWorker` if the SDK supports it.
+
+        Skips silently when:
+
+        * a worker is already running (idempotent);
+        * the SDK client lacks ``stream_get_listen_key`` (covers both
+          "python-binance not installed" and "test fixture using a
+          stub client without the listen-key methods" — neither path
+          should spawn a thread that just spins on errors);
+        * the factory itself raises (logged at WARNING, polling
+          fallback continues).
+        """
+        if self._user_data_worker is not None:
+            return
+        client = self._session.client
+        if client is None or not hasattr(client, "stream_get_listen_key"):
+            return
+        factory = self._user_data_worker_factory or BinanceUserDataWorker.for_session
+        try:
+            worker = factory(self._session)
+            worker.start()
+        except Exception as exc:                           # noqa: BLE001
+            logger.warning(
+                "Failed to start Binance user-data worker for %s: %s",
+                self.account_id, exc,
+            )
+            return
+        self._user_data_worker = worker
+
+    def test_connection(self) -> bool:
+        if not self._configured or not self._session.is_authenticated:
+            return False
+        ok, _msg = self._session.ping()
+        return ok
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._session.is_authenticated
+
+    def shutdown(self) -> None:
+        # V3 §F7 — stop the user-data worker first so its supervisor
+        # thread doesn't try to dispatch into a session we're about to
+        # release. ``stop()`` is idempotent and safe even if start()
+        # never ran.
+        worker = self._user_data_worker
+        self._user_data_worker = None
+        if worker is not None:
+            try:
+                worker.stop(timeout=5.0)
+            except Exception as exc:                       # noqa: BLE001
+                logger.warning(
+                    "BinanceUserDataWorker.stop raised on shutdown: %s", exc,
+                )
+        self._session.register_user_event_handler(None)
+        session_registry.release_session(self.INFO.name, self.alias)
+        self._order_meta.clear()
+        super().shutdown()
+
+    def get_timezone(self, segment: str | None = None) -> ZoneInfo:
+        """Crypto markets run 24/7 in UTC across spot + futures."""
+        return ZoneInfo("UTC")
+
+    def get_holiday_calendar(
+        self, segment: str | None = None
+    ) -> tuple[date, ...]:
+        """Return the empty 24/7 baseline (V3 §F5).
+
+        Binance never closes for civil/religious holidays — see the
+        ``BINANCE_24_7`` rationale at module level for the user-override
+        path for ad-hoc maintenance windows.
+        """
+        del segment  # crypto baseline is uniform across spot/futures
+        return BINANCE_24_7
+
+    def get_market_hours(
+        self, segment: str | None = None
+    ) -> tuple[MarketWindow, ...]:
+        """Return Binance's 24/7 trading window (V3 §F6).
+
+        Spot, USDM futures, and COINM futures all trade continuously
+        across all seven weekdays. The single window 00:00-23:59:59 UTC
+        with ``weekdays=(0..6)`` keeps the SignalRouter / RealtimeManager
+        hours gate permissive without any per-segment branch; an
+        ``"eod"`` schedule on a Binance account anchors to
+        ``23:59 - 15min = 23:44 UTC``, which is a sensible "daily
+        rotation" cutoff for the few users who still want a once-a-day
+        cron on a 24/7 venue.
+        """
+        del segment  # crypto schedule is uniform across spot/futures
+        return (
+            MarketWindow(
+                dtime(0, 0),
+                dtime(23, 59, 59),
+                weekdays=(0, 1, 2, 3, 4, 5, 6),
+                tz=ZoneInfo("UTC"),
+            ),
+        )
+
+    def calculate_fees(self, trade: TradeFill) -> Fees:
+        """Delegate to the Binance taker schedule above."""
+        return compute_binance_fees(trade)
+
+    # ── Orders ───────────────────────────────────────────────────────
+    def place_order(self, request: OrderRequest) -> OrderResponse:
+        if request.account_id != self.account_id:
+            return OrderResponse(ok=False, error="account mismatch")
+        if not self._session.is_authenticated:
+            return OrderResponse(ok=False, error="not authenticated")
+        if request.quantity <= 0:
+            return OrderResponse(ok=False, error="quantity must be positive")
+
+        segment = _resolve_segment(request.segment or request.exchange)
+        client = self._session.client
+        if client is None:
+            return OrderResponse(ok=False, error="client unavailable")
+
+        # Ensure precision cache is loaded for this segment.
+        self._session.load_symbols(segment)
+        symbol = request.symbol.upper()
+        qty = self._session.round_quantity(symbol, float(request.quantity), segment)
+        price = (
+            self._session.round_price(symbol, float(request.price or 0.0), segment)
+            if request.price is not None else None
+        )
+        trigger = (
+            self._session.round_price(symbol, float(request.trigger_price), segment)
+            if request.trigger_price is not None else None
+        )
+
+        side = "BUY" if request.side == "BUY" else "SELL"
+        order_type_map = _SPOT_ORDER_TYPE if segment == SPOT else _FUT_ORDER_TYPE
+        order_type = order_type_map.get(request.order_type, "MARKET")
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": order_type,
+            "quantity": qty,
+        }
+        if request.order_type in ("LIMIT", "SL"):
+            if price is None:
+                return OrderResponse(ok=False, error="price is required for LIMIT/SL")
+            params["price"] = format(price, "f")
+            params["timeInForce"] = "GTC"
+        if request.order_type in ("SL", "SL-M"):
+            if trigger is None:
+                return OrderResponse(
+                    ok=False, error="trigger_price is required for SL/SL-M",
+                )
+            params["stopPrice"] = format(trigger, "f")
+        # ``newClientOrderId`` is Binance's idempotency key — reuse the
+        # router's client_order_id so retries collide instead of duplicating.
+        params["newClientOrderId"] = request.client_order_id
+
+        method_name = _METHODS[segment]["place"]
+        # V3 §N3 — order-mutating methods declared in
+        # CAPABILITIES.static_ip_required_for traverse the SOCKS5 tunnel
+        # when the routing service supplies a live URL. ``proxy_url`` is
+        # re-evaluated per call (live resolver), so a tunnel that drops
+        # mid-session degrades to ``None`` and the call falls back to a
+        # direct connection rather than blocking.
+        proxy_url = (
+            self._routing.routed.proxy_url
+            if self._routing is not None else None
+        )
+        try:
+            with self._session.api_lock:
+                with _proxy_scope(client, proxy_url):
+                    result = getattr(client, method_name)(**params)
+        except Exception as exc:
+            msg = getattr(exc, "message", str(exc))
+            logger.error("Binance[%s] place_order failed: %s", self.alias, msg)
+            raise classify_binance_exception(exc) from exc
+
+        order_id = str(result.get("orderId") or result.get("clientOrderId") or "")
+        if not order_id:
+            return OrderResponse(ok=False, error="no orderId in response")
+        self._order_meta[order_id] = (segment, symbol)
+        logger.info(
+            "Binance[%s] %s %s:%s qty=%s → %s",
+            self.alias, side, segment, symbol, qty, order_id,
+        )
+        return OrderResponse(ok=True, broker_order_id=order_id)
+
+    def cancel_order(self, order_id: str) -> OrderResponse:
+        if not self._session.is_authenticated:
+            return OrderResponse(ok=False, error="not authenticated")
+        client = self._session.client
+        if client is None:
+            return OrderResponse(ok=False, error="client unavailable")
+
+        meta = self._order_meta.get(order_id)
+        if meta is None:
+            # Cache miss — likely a plugin restart between place + cancel.
+            # Rebuild from the broker's open-orders truth across segments
+            # instead of persisting a sidecar file: Binance is the source
+            # of truth, and a rebuilt cache can never be stale.
+            meta = self._rebuild_meta_from_open_orders(order_id)
+        if meta is None:
+            return OrderResponse(
+                ok=False,
+                error=(
+                    f"unknown order_id {order_id} — not found in cache "
+                    f"or in any segment's open-orders"
+                ),
+            )
+        segment, symbol = meta
+        method_name = _METHODS[segment]["cancel"]
+        # V3 §N3 — see place_order for routing rationale; live resolver
+        # propagates tunnel state changes without reconfiguration.
+        proxy_url = (
+            self._routing.routed.proxy_url
+            if self._routing is not None else None
+        )
+        try:
+            with self._session.api_lock:
+                with _proxy_scope(client, proxy_url):
+                    getattr(client, method_name)(
+                        symbol=symbol, orderId=int(order_id),
+                    )
+            return OrderResponse(ok=True, broker_order_id=order_id)
+        except Exception as exc:
+            logger.error(
+                "Binance[%s] cancel_order(%s) failed: %s",
+                self.alias, order_id, exc,
+            )
+            raise classify_binance_exception(exc) from exc
+
+    def _rebuild_meta_from_open_orders(
+        self, order_id: str,
+    ) -> tuple[str, str] | None:
+        """Look up segment+symbol for ``order_id`` from broker open-orders.
+
+        Iterates the three segment-keyed open-orders endpoints. Found
+        rows are folded back into ``self._order_meta`` so subsequent
+        cancels for the same session are O(1) again.
+
+        Returns the ``(segment, symbol)`` for the requested ``order_id``,
+        or ``None`` if it isn't open in any segment (already filled,
+        already cancelled, or never existed).
+        """
+        client = self._session.client
+        if client is None:
+            return None
+        target_meta: tuple[str, str] | None = None
+        for segment in SUPPORTED_SEGMENTS:
+            method_name = _METHODS[segment]["open_orders"]
+            try:
+                with self._session.api_lock:
+                    rows = getattr(client, method_name)() or []
+            except Exception as exc:
+                # A single segment being unavailable shouldn't abort
+                # the whole probe — keep walking the others.
+                logger.warning(
+                    "Binance[%s] %s open_orders during cache rebuild: %s",
+                    self.alias, segment, exc,
+                )
+                continue
+            for row in rows:
+                rid = str(row.get("orderId") or row.get("clientOrderId") or "")
+                rsym = str(row.get("symbol", ""))
+                if not rid or not rsym:
+                    continue
+                self._order_meta[rid] = (segment, rsym)
+                if rid == order_id:
+                    target_meta = (segment, rsym)
+        return target_meta
+
+    def modify_order(
+        self, order_id: str, changes: OrderModification
+    ) -> OrderResponse:
+        raise NotImplementedError(
+            "Binance does not support order modification — cancel + re-place."
+        )
+
+    # ── Queries ──────────────────────────────────────────────────────
+    def get_order_book(self) -> list[OrderRecord]:
+        if not self._session.is_authenticated:
+            return []
+        client = self._session.client
+        if client is None:
+            return []
+        out: list[OrderRecord] = []
+        for segment in SUPPORTED_SEGMENTS:
+            method_name = _METHODS[segment]["open_orders"]
+            try:
+                with self._session.api_lock:
+                    orders = getattr(client, method_name)() or []
+            except Exception as exc:
+                logger.warning(
+                    "Binance[%s] %s open_orders failed: %s",
+                    self.alias, segment, exc,
+                )
+                continue
+            for o in orders:
+                out.append(_order_to_record(o, segment))
+        return out
+
+    def get_positions(self) -> list[Position]:
+        if not self._session.is_authenticated:
+            return []
+        client = self._session.client
+        if client is None:
+            return []
+        positions: list[Position] = []
+
+        # Spot: derive from balances (crypto doesn't carry an avg-price
+        # field on the exchange — it's local-only, and best effort).
+        try:
+            with self._session.api_lock:
+                account = client.get_account() or {}
+        except Exception as exc:
+            logger.warning("Binance[%s] spot account: %s", self.alias, exc)
+            account = {}
+        for b in account.get("balances", []) or []:
+            try:
+                total = float(b.get("free", 0)) + float(b.get("locked", 0))
+            except (TypeError, ValueError):
+                continue
+            if total <= 0.0001:
+                continue
+            positions.append(Position(
+                symbol=str(b.get("asset", "")),
+                exchange=SPOT,
+                quantity=int(total) if total >= 1 else 0,
+                average_price=0.0,
+                pnl=0.0,
+                product="SPOT",
+            ))
+
+        # Futures (USDM + COINM): the positions endpoints return rich data.
+        for segment in (USDM, COINM):
+            method_name = _METHODS[segment].get("positions")
+            if not method_name:
+                continue
+            try:
+                with self._session.api_lock:
+                    rows = getattr(client, method_name)() or []
+            except Exception as exc:
+                logger.warning(
+                    "Binance[%s] %s positions failed: %s",
+                    self.alias, segment, exc,
+                )
+                continue
+            for p in rows:
+                qty = _safe_float(p.get("positionAmt", 0.0))
+                if qty == 0.0:
+                    continue
+                positions.append(Position(
+                    symbol=str(p.get("symbol", "")),
+                    exchange=segment,
+                    quantity=int(qty),
+                    average_price=_safe_float(p.get("entryPrice", 0.0)),
+                    pnl=_safe_float(p.get("unRealizedProfit", 0.0)),
+                    product=segment,
+                ))
+        return positions
+
+    def get_margins(self) -> Margins:
+        """USDT free balance, prioritising USD-M futures wallet when
+        present (that's where leveraged traders park capital)."""
+        if not self._session.is_authenticated:
+            return Margins(available=0.0, used=0.0, total=0.0, currency="USDT")
+        client = self._session.client
+        if client is None:
+            return Margins(available=0.0, used=0.0, total=0.0, currency="USDT")
+
+        # Prefer USDM futures wallet (the primary place-order balance for
+        # leveraged segments). Fall back to spot USDT.
+        try:
+            with self._session.api_lock:
+                acct = client.futures_account() or {}
+            avail = _safe_float(acct.get("availableBalance", 0.0))
+            used = _safe_float(acct.get("totalInitialMargin", 0.0))
+            total = _safe_float(acct.get("totalWalletBalance", avail))
+            if total or avail:
+                return Margins(
+                    available=avail, used=used, total=total, currency="USDT",
+                )
+        except Exception as exc:
+            logger.info(
+                "Binance[%s] futures_account unavailable, falling back to spot: %s",
+                self.alias, exc,
+            )
+
+        try:
+            with self._session.api_lock:
+                spot = client.get_account() or {}
+        except Exception as exc:
+            logger.warning("Binance[%s] spot margins: %s", self.alias, exc)
+            return Margins(available=0.0, used=0.0, total=0.0, currency="USDT")
+        for b in spot.get("balances", []) or []:
+            if b.get("asset") == "USDT":
+                free = _safe_float(b.get("free", 0.0))
+                locked = _safe_float(b.get("locked", 0.0))
+                return Margins(
+                    available=free, used=locked, total=free + locked,
+                    currency="USDT",
+                )
+        return Margins(available=0.0, used=0.0, total=0.0, currency="USDT")
+
+    # ── User-data-stream parser (V3 §F7) ─────────────────────────────
+    def _on_binance_user_event(self, event: dict) -> None:
+        """Parse a Binance user-data event into an :class:`ExecutionReport`.
+
+        Handles two event shapes:
+
+        * **Spot** (``executionReport``) — flat dict with keys ``i`` (orderId),
+          ``X`` (status), ``z`` (cumulative filled), ``l`` (last fill qty),
+          ``L`` (last fill price), ``Z`` / ``z`` for cumulative quote.
+        * **USDM/COINM** (``ORDER_TRADE_UPDATE``) — wraps order data under
+          an ``"o"`` key with the same field abbreviations.
+
+        Unknown events / unknown statuses are silent — polling keeps writing.
+        """
+        if not isinstance(event, dict):
+            return
+        event_type = str(event.get("e") or "")
+        if event_type == "executionReport":
+            order = event
+            ts_ms = int(event.get("T") or event.get("E") or 0)
+        elif event_type == "ORDER_TRADE_UPDATE":
+            order = event.get("o") or {}
+            ts_ms = int(event.get("T") or event.get("E") or 0)
+        else:
+            return
+
+        broker_order_id = str(order.get("i") or "").strip()
+        if not broker_order_id:
+            return
+        binance_status = str(order.get("X") or "").upper()
+        exec_type = _BINANCE_STATUS_TO_EXEC_TYPE.get(binance_status)
+        if exec_type is None:
+            return
+        cumulative_qty = _safe_float(order.get("z"))
+        last_qty = _safe_float(order.get("l"))
+        last_price = _safe_float(order.get("L"))
+        # Spot uses Z (cumulative quote) / z (cumulative qty); avg = Z/z.
+        # Futures provide ap (average price) directly.
+        avg_price = _safe_float(order.get("ap"))
+        if avg_price == 0.0:
+            cum_quote = _safe_float(order.get("Z"))
+            avg_price = cum_quote / cumulative_qty if cumulative_qty else 0.0
+
+        ts = (
+            datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+            if ts_ms else datetime.now(timezone.utc)
+        )
+        report = ExecutionReport(
+            order_id=str(order.get("c") or ""),
+            broker_order_id=broker_order_id,
+            exec_type=exec_type,
+            cumulative_qty=cumulative_qty,
+            last_qty=last_qty,
+            last_price=last_price,
+            avg_price=avg_price,
+            timestamp=ts,
+            raw=dict(event),
+        )
+        self._emit_execution_report(report)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Helpers (pure — unit-tested directly)
+# ══════════════════════════════════════════════════════════════════════
+def _coerce_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def _safe_float(v: object) -> float:
+    try:
+        return float(v)           # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _resolve_segment(exchange: str) -> str:
+    """Route an exchange/segment hint to a concrete Binance segment."""
+    if not exchange:
+        return SPOT
+    e = exchange.upper().replace("-", "_")
+    if e in (SPOT, "SPOT", "BINANCE_SPOT", "BINANCE"):
+        return SPOT
+    if e in (USDM, "USDM", "USDM_FUTURES", "USD_M", "USD_M_FUTURES", "FUTURES"):
+        return USDM
+    if e in (COINM, "COINM", "COINM_FUTURES", "COIN_M", "COIN_M_FUTURES"):
+        return COINM
+    return SPOT
+
+
+def _order_to_record(o: dict, segment: str) -> OrderRecord:
+    """Canonicalise a Binance open-order dict → :class:`OrderRecord`."""
+    status = _STATUS_MAP.get(str(o.get("status", "")).upper(), "PENDING")
+    t_ms = o.get("time") or o.get("updateTime") or 0
+    try:
+        placed = datetime.fromtimestamp(int(t_ms) / 1000, tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        placed = datetime.now(timezone.utc)
+    return OrderRecord(
+        broker_order_id=str(o.get("orderId") or o.get("clientOrderId") or ""),
+        symbol=str(o.get("symbol", "")),
+        exchange=segment,
+        side=str(o.get("side", "")),
+        quantity=int(_safe_float(o.get("origQty", 0))),
+        filled_quantity=int(_safe_float(o.get("executedQty", 0))),
+        order_type=str(o.get("type", "")),
+        product=segment,
+        status=status,       # type: ignore[arg-type]
+        price=_safe_float(o.get("price", 0.0)) or None,
+        trigger_price=_safe_float(o.get("stopPrice", 0.0)) or None,
+        placed_at=placed,
+        reason=str(o.get("reason", "")),
+    )

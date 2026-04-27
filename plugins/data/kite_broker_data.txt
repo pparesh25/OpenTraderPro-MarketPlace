@@ -1,0 +1,964 @@
+# plugin-type: plugin-data
+"""Zerodha Kite — V3 user-`.txt` data plugin.
+
+Provides Indian market data via Kite Connect for one alias:
+
+* Historical OHLCV (REST)
+* Real-time ticks (KiteTicker)
+* Symbol search against the cached instruments table
+* Coverage — NSE, BSE, MCX, NFO, CDS
+
+Two aliases (e.g. ``zerodha::main``, ``zerodha::wife``) get completely
+independent :class:`KiteSession` objects via the shared
+:mod:`opentrader.connectors_v2.session_registry` — one OAuth login per
+alias is shared across this file and the matching `kite_broker_exec.txt`.
+
+The :class:`KiteSession` class body MUST be byte-identical between this
+file and ``kite_broker_exec.txt`` per the V3 §R2 Decision-3=3d contract.
+"""
+
+from __future__ import annotations
+
+import http.server
+import logging
+import threading
+import time
+import webbrowser
+from collections.abc import Callable
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from types import MappingProxyType
+from typing import Any, ClassVar
+from urllib.parse import parse_qs, urlparse
+from zoneinfo import ZoneInfo
+
+from opentrader.connectors_v2 import session_registry
+from opentrader.connectors_v2.contract import (
+    AuthResult,
+    Capabilities,
+    CredentialField,
+    DataPluginV2,
+    MarketWindow,
+    OhlcvBar,
+    PluginInfo,
+    SessionRouting,
+    SymbolInfo,
+    Tick,
+    segment_matches,
+)
+
+
+logger = logging.getLogger(__name__)
+
+# Kite Connect access tokens expire at 06:00 IST every trading day.
+# https://kite.trade/docs/connect/v3/user/#user
+IST = timezone(timedelta(hours=5, minutes=30))
+_KITE_TOKEN_EXPIRY_TIME_IST = dtime(6, 0)
+
+
+def _next_kite_token_expiry(now: datetime | None = None) -> datetime:
+    """Return the next 06:00 IST after ``now``."""
+    now = (now or datetime.now(IST)).astimezone(IST)
+    expiry_today = now.replace(
+        hour=_KITE_TOKEN_EXPIRY_TIME_IST.hour,
+        minute=_KITE_TOKEN_EXPIRY_TIME_IST.minute,
+        second=0, microsecond=0,
+    )
+    if now < expiry_today:
+        return expiry_today
+    return expiry_today + timedelta(days=1)
+
+
+# ── Optional dependency ────────────────────────────────────────────────
+try:
+    from kiteconnect import KiteConnect, KiteTicker
+
+    KITE_AVAILABLE = True
+except ImportError:
+    KITE_AVAILABLE = False
+    KiteConnect = None  # type: ignore[assignment,misc]
+    KiteTicker = None   # type: ignore[assignment,misc]
+    logger.info(
+        "kiteconnect not installed — zerodha plugin reports unavailable. "
+        "Install with: pip install kiteconnect"
+    )
+
+
+# ── Public maps (stable across aliases) ────────────────────────────────
+TIMEFRAME_MAP = {
+    "1m": "minute", "3m": "3minute", "5m": "5minute", "10m": "10minute",
+    "15m": "15minute", "30m": "30minute", "1h": "60minute",
+    "D": "day", "W": "week", "M": "month",
+    "1min": "minute", "3min": "3minute", "5min": "5minute",
+    "10min": "10minute", "15min": "15minute", "30min": "30minute",
+    "1hour": "60minute", "1D": "day", "1W": "week", "1M": "month",
+}
+PRODUCT_MAP = {"CNC": "CNC", "MIS": "MIS", "NRML": "NRML"}
+ORDER_TYPE_MAP = {"MARKET": "MARKET", "LIMIT": "LIMIT", "SL": "SL", "SL-M": "SL-M"}
+
+
+# ── Local redirect server for OAuth ────────────────────────────────────
+_REDIRECT_PORT = 5678
+_REDIRECT_PATH = "/callback"
+
+
+class _TokenCaptureHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP handler that captures the Kite OAuth request_token."""
+
+    captured_token: str = ""
+
+    def do_GET(self):                                  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path == _REDIRECT_PATH:
+            token = parse_qs(parsed.query).get("request_token", [""])[0]
+            _TokenCaptureHandler.captured_token = token
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            body = (
+                b"<h2>Login Successful!</h2><p>Return to OpenTrader-Pro.</p>"
+                if token else b"<h2>Login Failed</h2><p>No token received.</p>"
+            )
+            self.wfile.write(b"<html><body>" + body + b"</body></html>")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):              # noqa: A002
+        pass                                            # silence log noise
+
+
+# ══════════════════════════════════════════════════════════════════════
+# KiteSession — one per alias. BYTE-IDENTICAL with kite_broker_exec.txt.
+# Both sides construct via session_registry.get_or_create_session(
+#   namespace="zerodha", alias=…, factory=KiteSession) so a single
+# OAuth login covers both data and exec for the same alias.
+# ══════════════════════════════════════════════════════════════════════
+class KiteSession:
+    """Owns a pair of ``KiteConnect`` instances (direct + proxied) for one alias.
+
+    Never construct directly — always go through
+    ``session_registry.get_or_create_session(namespace="zerodha", alias=…,
+    factory=KiteSession)`` so the data + exec ``.txt`` files share one
+    OAuth flow per alias.
+    """
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        self._api_key: str = ""
+        self._api_secret: str = ""
+        self._access_token: str = ""
+        self._authenticated: bool = False
+        # Wall-clock when the current access token becomes invalid.
+        # Kite mints daily-expiry tokens; populated at successful login.
+        self._expires_at: datetime | None = None
+
+        self._kite: Any | None = None             # direct
+        self._kite_exec: Any | None = None        # proxied
+
+        # Symbol/token caches
+        self._instruments: dict[str, list[dict]] = {}
+        self._token_cache: dict[str, int] = {}
+        self._reverse_token_cache: dict[int, str] = {}
+        # symbol → exchange; order-dependent when a trading symbol exists on
+        # multiple exchanges (RELIANCE is on both NSE + BSE). Unsafe for tick
+        # routing — prefer ``_token_exch_cache`` which is keyed on the
+        # globally-unique instrument token.
+        self._exch_lookup: dict[str, str] = {}
+        # token → exchange; populated at the same time as reverse_token_cache
+        # so ``_on_raw_ticks`` can disambiguate without guessing.
+        self._token_exch_cache: dict[int, str] = {}
+        self._lot_size_cache: dict[str, int] = {}
+
+        # Serialize concurrent REST calls (KiteConnect uses requests.Session).
+        # Public so data / exec plugins can wrap their own direct kite calls.
+        self.api_lock = threading.Lock()
+
+        # Order-update push channel. KiteTicker (created by the data side)
+        # exposes ``on_order_update`` postbacks; the exec side registers a
+        # parser via ``register_order_update_handler`` and the data side's
+        # ticker dispatches into it through ``dispatch_order_update``.
+        # Storing it here means data + exec stay decoupled — neither imports
+        # the other — while sharing the single ticker WS connection.
+        self._order_update_handler: Callable[[dict], None] | None = None
+
+    # ── Basic predicates ─────────────────────────────────────────────
+    @property
+    def is_available(self) -> bool:
+        return KITE_AVAILABLE
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._api_key and self._api_secret)
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._authenticated
+
+    @property
+    def expires_at(self) -> datetime | None:
+        """When the current access token becomes invalid (None if no session)."""
+        return self._expires_at
+
+    @property
+    def kite(self) -> Any:
+        return self._kite
+
+    @property
+    def kite_exec(self) -> Any:
+        """Proxied instance, or direct if no proxy configured."""
+        return self._kite_exec if self._kite_exec is not None else self._kite
+
+    @property
+    def has_proxy(self) -> bool:
+        """True iff a proxied :class:`KiteConnect` instance is installed."""
+        return self._kite_exec is not None
+
+    # ── Configuration ────────────────────────────────────────────────
+    def configure(self, api_key: str, api_secret: str) -> bool:
+        """Create (or reuse) the direct KiteConnect instance for this alias."""
+        if not KITE_AVAILABLE:
+            return False
+        if (
+            self._kite is not None
+            and self._api_key == api_key
+            and self._api_secret == api_secret
+        ):
+            return True
+        self._api_key = api_key
+        self._api_secret = api_secret
+        self._kite = KiteConnect(api_key=api_key)
+        if self._authenticated and self._access_token:
+            self._kite.set_access_token(self._access_token)
+        logger.info(
+            "KiteSession[%s] configured (api_key=%s***)", self.alias, api_key[:4]
+        )
+        return True
+
+    def configure_exec_proxy(self, proxy_url: str | None) -> None:
+        """Create (or clear) the proxied exec KiteConnect instance."""
+        if not KITE_AVAILABLE or not self._api_key:
+            return
+
+        if not proxy_url:
+            self._kite_exec = None
+            logger.info("KiteSession[%s] exec proxy cleared.", self.alias)
+            return
+
+        if proxy_url.startswith("socks5://"):
+            proxy_url = proxy_url.replace("socks5://", "socks5h://", 1)
+
+        proxies = {"http": proxy_url, "https": proxy_url}
+        self._kite_exec = KiteConnect(api_key=self._api_key, proxies=proxies)
+        if hasattr(self._kite_exec, "reqsession"):
+            self._kite_exec.reqsession.proxies.update(proxies)
+        if self._authenticated and self._access_token:
+            self._kite_exec.set_access_token(self._access_token)
+        logger.info(
+            "KiteSession[%s] exec proxy: %s", self.alias, proxy_url
+        )
+
+    # ── OAuth ────────────────────────────────────────────────────────
+    def login(self, timeout: int = 120) -> tuple[bool, str]:
+        """Browser-based OAuth login. Blocking — call from a worker thread."""
+        if not KITE_AVAILABLE:
+            return False, "kiteconnect not installed."
+        if not self.is_configured:
+            return False, "Not configured. Provide api_key + api_secret."
+
+        try:
+            _TokenCaptureHandler.captured_token = ""
+            server = http.server.HTTPServer(
+                ("127.0.0.1", _REDIRECT_PORT), _TokenCaptureHandler
+            )
+            server.timeout = 2
+            server_thread = threading.Thread(
+                target=self._run_redirect_server,
+                args=(server, timeout), daemon=True,
+                name=f"KiteRedirect-{self.alias}",
+            )
+            server_thread.start()
+
+            webbrowser.open(self._kite.login_url())
+            start = time.time()
+            while time.time() - start < timeout:
+                if _TokenCaptureHandler.captured_token:
+                    break
+                time.sleep(0.5)
+            server_thread.join(timeout=5)
+
+            request_token = _TokenCaptureHandler.captured_token
+            if not request_token:
+                return False, "Login timed out — no request token received."
+
+            data = self._kite.generate_session(
+                request_token, api_secret=self._api_secret
+            )
+            self._set_access_token(data["access_token"])
+            self._authenticated = True
+            self._expires_at = _next_kite_token_expiry()
+            threading.Thread(
+                target=self._load_instruments, daemon=True,
+                name=f"KiteInstruments-{self.alias}",
+            ).start()
+            user = data.get("user_name", data.get("user_id", ""))
+            logger.info(
+                "KiteSession[%s] login OK — user %s, token expires %s",
+                self.alias, user, self._expires_at.isoformat(timespec="minutes"),
+            )
+            return True, f"Login successful. Welcome, {user}!"
+        except Exception as exc:
+            self._authenticated = False
+            logger.error("KiteSession[%s] login failed: %s", self.alias, exc)
+            return False, f"Login failed: {exc}"
+
+    def login_with_token(self, request_token: str) -> tuple[bool, str]:
+        """Manual fallback when the browser flow isn't available."""
+        if not self.is_configured:
+            return False, "Not configured."
+        try:
+            data = self._kite.generate_session(
+                request_token, api_secret=self._api_secret
+            )
+            self._set_access_token(data["access_token"])
+            self._authenticated = True
+            self._expires_at = _next_kite_token_expiry()
+            self._load_instruments()
+            return True, f"Login successful. User: {data.get('user_name', '')}"
+        except Exception as exc:
+            return False, f"Login failed: {exc}"
+
+    def logout(self) -> None:
+        if self._kite and self._authenticated:
+            try:
+                self._kite.invalidate_access_token(self._access_token)
+            except Exception as exc:
+                logger.warning(
+                    "KiteSession[%s] logout warn: %s", self.alias, exc
+                )
+        self._authenticated = False
+        self._access_token = ""
+        self._expires_at = None
+        if self._kite_exec:
+            try:
+                self._kite_exec.set_access_token("")
+            except Exception as exc:
+                logger.debug(
+                    "KiteSession[%s] proxy clear-token failed: %s",
+                    self.alias, exc,
+                )
+        logger.info("KiteSession[%s] logged out.", self.alias)
+
+    # ── Instruments cache ────────────────────────────────────────────
+    def _load_instruments(self) -> None:
+        if not self._authenticated or not self._kite:
+            return
+        for exch in ("NSE", "BSE", "MCX", "NFO", "CDS"):
+            try:
+                with self.api_lock:
+                    instruments = self._kite.instruments(exch)
+                self._instruments[exch] = instruments
+                for inst in instruments:
+                    sym = inst["tradingsymbol"]
+                    token = inst["instrument_token"]
+                    key = f"{exch}:{sym}"
+                    self._token_cache[key] = token
+                    self._reverse_token_cache[token] = sym
+                    self._token_exch_cache[token] = exch
+                    self._exch_lookup[sym] = exch
+                    self._lot_size_cache[key] = inst.get("lot_size", 1)
+                logger.info(
+                    "KiteSession[%s] cached %d %s instruments",
+                    self.alias, len(instruments), exch,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "KiteSession[%s] failed %s instruments: %s",
+                    self.alias, exch, exc,
+                )
+
+    def get_instruments(self, exchange: str = "NSE") -> list[dict]:
+        return self._instruments.get(exchange, [])
+
+    def resolve_token(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        *,
+        wait_timeout: float = 15.0,
+    ) -> int | None:
+        """Look up ``symbol`` on ``exchange``; return instrument token or None."""
+        key = f"{exchange}:{symbol}"
+        token = self._token_cache.get(key)
+        if token is not None:
+            return token
+        if wait_timeout > 0 and not self._instruments.get(exchange):
+            deadline = time.time() + wait_timeout
+            while time.time() < deadline and not self._instruments.get(exchange):
+                time.sleep(0.1)
+            token = self._token_cache.get(key)
+            if token is not None:
+                return token
+        for inst in self._instruments.get(exchange, []):
+            if inst["tradingsymbol"] == symbol:
+                t = inst["instrument_token"]
+                self._token_cache[key] = t
+                self._reverse_token_cache[t] = symbol
+                self._token_exch_cache[t] = exchange
+                return t
+        return None
+
+    def find_exchange(self, symbol: str) -> str | None:
+        exch = self._exch_lookup.get(symbol)
+        if exch:
+            return exch
+        for e in ("NSE", "NFO", "MCX", "CDS", "BSE"):
+            if f"{e}:{symbol}" in self._token_cache:
+                return e
+        return None
+
+    def get_lot_size(self, symbol: str, exchange: str) -> int:
+        return self._lot_size_cache.get(f"{exchange}:{symbol}", 1)
+
+    def get_symbol_from_token(self, token: int) -> str | None:
+        return self._reverse_token_cache.get(token)
+
+    def get_exchange_from_token(self, token: int) -> str | None:
+        """Return the exchange a token was loaded from."""
+        return self._token_exch_cache.get(token)
+
+    def search_instruments(
+        self, query: str, exchange: str = "NSE", limit: int = 20
+    ) -> list[dict]:
+        q = query.upper()
+        out: list[dict] = []
+        for inst in self._instruments.get(exchange, []):
+            if (
+                q in inst.get("tradingsymbol", "").upper()
+                or q in inst.get("name", "").upper()
+            ):
+                out.append({
+                    "symbol": inst["tradingsymbol"],
+                    "name": inst.get("name", ""),
+                    "exchange": exchange,
+                    "type": inst.get("instrument_type", "EQ"),
+                    "lot_size": inst.get("lot_size", 1),
+                    "tick_size": inst.get("tick_size", 0.05),
+                })
+                if len(out) >= limit:
+                    break
+        return out
+
+    # ── Ticker ───────────────────────────────────────────────────────
+    def create_ticker(self) -> Any | None:
+        """KiteTicker uses direct connection; live data never needs static IP."""
+        if not KITE_AVAILABLE or not self._authenticated:
+            return None
+        return KiteTicker(self._api_key, self._access_token)
+
+    # ── Order-update push channel (V3 §F7) ───────────────────────────
+    def register_order_update_handler(
+        self, handler: Callable[[dict], None] | None
+    ) -> None:
+        """Register a parser for KiteTicker ``on_order_update`` postbacks."""
+        self._order_update_handler = handler
+
+    def dispatch_order_update(self, data: dict) -> None:
+        """Forward a Kite postback dict to the registered handler."""
+        handler = self._order_update_handler
+        if handler is None:
+            return
+        try:
+            handler(data)
+        except Exception as exc:
+            logger.exception(
+                "KiteSession[%s] order-update handler raised: %s",
+                self.alias, exc,
+            )
+
+    # ── Internals ────────────────────────────────────────────────────
+    def _set_access_token(self, token: str) -> None:
+        self._access_token = token
+        if self._kite:
+            self._kite.set_access_token(token)
+        if self._kite_exec:
+            self._kite_exec.set_access_token(token)
+
+    def _dispose(self) -> None:
+        """Drop KiteConnect instances. Called by session_registry when the
+        last user releases this session."""
+        self._kite = None
+        self._kite_exec = None
+        self._instruments.clear()
+        self._token_cache.clear()
+        self._reverse_token_cache.clear()
+        self._token_exch_cache.clear()
+        self._exch_lookup.clear()
+        self._lot_size_cache.clear()
+        self._authenticated = False
+        self._access_token = ""
+
+    @staticmethod
+    def _run_redirect_server(
+        server: http.server.HTTPServer, timeout: int
+    ) -> None:
+        start = time.time()
+        while time.time() - start < timeout:
+            if _TokenCaptureHandler.captured_token:
+                break
+            server.handle_request()
+        try:
+            server.server_close()
+        except Exception as exc:
+            logger.debug("OAuth redirect server close failed: %s", exc)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# DataPlugin
+# ══════════════════════════════════════════════════════════════════════
+class DataPlugin(DataPluginV2):
+    """Zerodha data feed — one instance per alias, per-alias KiteSession."""
+
+    INFO: ClassVar[PluginInfo] = PluginInfo(
+        name="zerodha",
+        display_name="Zerodha Kite",
+        version="2.0.0",
+        author="OpenTrader",
+        min_app_api="2.0",
+        description=(
+            "Indian equities / F&O / commodities via Zerodha Kite Connect — "
+            "per-account sessions for multi-login workflows."
+        ),
+    )
+    CREDENTIAL_SCHEMA: ClassVar[tuple[CredentialField, ...]] = (
+        CredentialField("api_key",    "API Key",    "text"),
+        CredentialField("api_secret", "API Secret", "password"),
+        CredentialField(
+            "proxy_url", "Exec Proxy URL", "text", required=False,
+            help_text=(
+                "Optional SOCKS5 URL for SEBI-static-IP order execution "
+                "(e.g. socks5h://127.0.0.1:8080)."
+            ),
+        ),
+    )
+    CAPABILITIES: ClassVar[Capabilities] = Capabilities(
+        segments=("NSE", "NSE_EQ", "BSE", "BSE_EQ", "NFO", "MCX", "CDS"),
+        realtime=True,
+        historical=True,
+        search=True,
+        exchange_to_segment=MappingProxyType({
+            "NSE": "NSE_EQ",
+            "BSE": "BSE_EQ",
+        }),
+    )
+
+    # ── Construction ─────────────────────────────────────────────────
+    def __init__(self, alias: str) -> None:
+        super().__init__(alias)
+        self._session: KiteSession = session_registry.get_or_create_session(
+            namespace=self.INFO.name, alias=alias, factory=KiteSession,
+        )
+        self._configured = False
+        self._ticker: Any | None = None
+        self._on_tick: Callable[[Tick], None] | None = None
+        self._subscribed_tokens: list[int] = []
+        self._pending_tokens: list[int] = []
+        self._ws_connected: bool = False
+        self._tokens_lock = threading.Lock()
+        self._last_cum_volume: dict[int, int] = {}
+
+    # ── Lifecycle ────────────────────────────────────────────────────
+    def configure(
+        self,
+        credentials: dict[str, str],
+        *,
+        routing: SessionRouting | None = None,
+    ) -> None:
+        if not KITE_AVAILABLE:
+            raise RuntimeError(
+                "kiteconnect not installed. Run: pip install kiteconnect"
+            )
+        api_key = credentials.get("api_key", "")
+        api_secret = credentials.get("api_secret", "")
+        if not api_key or not api_secret:
+            raise ValueError("api_key and api_secret are required")
+        ok = self._session.configure(api_key, api_secret)
+        if not ok:
+            raise RuntimeError("KiteSession.configure() failed")
+        # V3 §N2 — Kite's market-data APIs (historical candles, KiteTicker
+        # WS) are not on the SEBI static-IP allowlist; ``routing`` is
+        # accepted for ABC conformance but deliberately ignored here.
+        # The exec side owns the routed path via ``configure_exec_proxy``.
+        del routing
+        self._configured = True
+
+    def authenticate(self) -> AuthResult:
+        """Browser OAuth. Call from a worker thread."""
+        if not KITE_AVAILABLE:
+            return AuthResult(ok=False, error="kiteconnect not installed")
+        if not self._configured:
+            return AuthResult(ok=False, error="not configured")
+        if self._session.is_authenticated:
+            self._authenticated = True
+            return AuthResult(ok=True, expires_at=self._session.expires_at)
+        ok, msg = self._session.login()
+        if ok:
+            self._authenticated = True
+            return AuthResult(ok=True, expires_at=self._session.expires_at)
+        return AuthResult(ok=False, error=msg)
+
+    def authenticate_with_token(self, token: str) -> AuthResult:
+        """Manual fallback — see ``ExecPlugin.authenticate_with_token``."""
+        if not KITE_AVAILABLE:
+            return AuthResult(ok=False, error="kiteconnect not installed")
+        if not self._configured:
+            return AuthResult(ok=False, error="not configured")
+        if not token or not token.strip():
+            return AuthResult(ok=False, error="request_token is empty")
+        ok, msg = self._session.login_with_token(token.strip())
+        if ok:
+            self._authenticated = True
+            return AuthResult(ok=True, expires_at=self._session.expires_at)
+        return AuthResult(ok=False, error=msg)
+
+    def test_connection(self) -> bool:
+        if not self._configured or not self._session.is_authenticated:
+            return False
+        try:
+            self._session.kite.profile()
+            return True
+        except Exception:
+            return bool(self._session.get_instruments("NSE"))
+
+    @property
+    def is_authenticated(self) -> bool:
+        return self._session.is_authenticated
+
+    def shutdown(self) -> None:
+        if self._ticker is not None:
+            try:
+                self._ticker.close()
+            except Exception as exc:                      # pragma: no cover
+                logger.debug(
+                    "Zerodha[%s] ticker close failed: %s", self.alias, exc,
+                )
+            self._ticker = None
+        session_registry.release_session(self.INFO.name, self.alias)
+        self._on_tick = None
+        super().shutdown()
+
+    def get_timezone(self, segment: str | None = None) -> ZoneInfo:
+        """Zerodha covers Indian exchanges; all segments share IST."""
+        return ZoneInfo("Asia/Kolkata")
+
+    def get_market_hours(
+        self, segment: str | None = None
+    ) -> tuple[MarketWindow, ...]:
+        """Mirror ``ExecPlugin.get_market_hours`` for the data side."""
+        ist = ZoneInfo("Asia/Kolkata")
+        equity = MarketWindow(dtime(9, 15), dtime(15, 30), tz=ist)
+        commodity = MarketWindow(dtime(9, 0), dtime(23, 55), tz=ist)
+        seg = (segment or "").upper()
+        if seg.startswith("MCX"):
+            return (commodity,)
+        if seg in {"NSE", "NSE_EQ", "BSE", "BSE_EQ", "NFO", "BFO", "CDS", "BCD"}:
+            return (equity,)
+        return (equity, commodity)
+
+    # ── Historical ───────────────────────────────────────────────────
+    def fetch_historical(
+        self,
+        symbol: str,
+        exchange: str,
+        timeframe: str,
+        start: date,
+        end: date,
+    ) -> list[OhlcvBar]:
+        if not self._session.is_authenticated:
+            raise RuntimeError("Not authenticated — call authenticate() first.")
+
+        clean_symbol = symbol.split(".")[0] if "." in symbol else symbol
+        token = self._session.resolve_token(clean_symbol, exchange or "NSE")
+        if token is None and not exchange:
+            for exch in ("NSE", "BSE", "MCX", "NFO", "CDS"):
+                token = self._session.resolve_token(clean_symbol, exch)
+                if token is not None:
+                    exchange = exch
+                    break
+        if token is None:
+            raise ValueError(
+                f"Instrument not found: {clean_symbol} on {exchange or '?'}"
+            )
+
+        interval = TIMEFRAME_MAP.get(timeframe, "day")
+        from_dt = datetime.combine(start, datetime.min.time(), tzinfo=IST)
+        to_dt = datetime.combine(end, datetime.min.time(), tzinfo=IST)
+        to_dt = to_dt.replace(hour=23, minute=59, second=59)
+
+        with self._session.api_lock:
+            rows = self._session.kite.historical_data(
+                instrument_token=token,
+                from_date=from_dt,
+                to_date=to_dt,
+                interval=interval,
+                continuous=False,
+                oi=False,
+            )
+
+        bars: list[OhlcvBar] = []
+        for candle in rows or []:
+            dt = candle["date"]
+            if hasattr(dt, "astimezone"):
+                dt = dt.astimezone(IST)
+            bars.append(OhlcvBar(
+                timestamp=dt,
+                open=float(candle["open"]),
+                high=float(candle["high"]),
+                low=float(candle["low"]),
+                close=float(candle["close"]),
+                volume=int(candle.get("volume", 0)),
+            ))
+        logger.info(
+            "Zerodha[%s] historical %s:%s %s → %d bars",
+            self.alias, exchange, clean_symbol, interval, len(bars),
+        )
+        return bars
+
+    # ── Symbol search ────────────────────────────────────────────────
+    _ALL_EXCHANGES: ClassVar[tuple[str, ...]] = ("NSE", "BSE", "MCX", "NFO", "CDS")
+
+    def search_symbols(
+        self,
+        query: str,
+        exchange: str | None = None,
+        segment: str | None = None,
+    ) -> list[SymbolInfo]:
+        if not self._session.is_authenticated:
+            raise RuntimeError("Not authenticated.")
+        target_exchanges = (
+            (exchange.upper(),) if exchange else self._ALL_EXCHANGES
+        )
+        if not self._session.get_instruments(target_exchanges[0]):
+            raise RuntimeError(
+                "Instrument list not yet loaded — try again in a moment."
+            )
+        wanted_segment = segment.upper() if segment else None
+        hits: list[SymbolInfo] = []
+        for exch in target_exchanges:
+            for row in self._session.search_instruments(query, exch, limit=10):
+                row_segment = _segment_for(exch, row.get("type", "EQ"))
+                if not segment_matches(row_segment, wanted_segment):
+                    continue
+                hits.append(SymbolInfo(
+                    symbol=row["symbol"],
+                    exchange=exch,
+                    segment=row_segment,
+                    tick_size=float(row.get("tick_size", 0.05)),
+                    lot_size=int(row.get("lot_size", 1)),
+                    display_name=row.get("name", ""),
+                ))
+                if len(hits) >= 20:
+                    return hits
+        return hits
+
+    # ── Realtime ─────────────────────────────────────────────────────
+    def subscribe_realtime(
+        self,
+        symbols: list[tuple[str, str]],
+        on_tick: Callable[[Tick], None],
+    ) -> None:
+        if not self._session.is_authenticated:
+            raise RuntimeError("Not authenticated.")
+
+        self._on_tick = on_tick
+        tokens: list[int] = []
+        for sym, exch in symbols:
+            token = self._session.resolve_token(sym, exch)
+            if token is None:
+                for e in ("NSE", "BSE", "NFO", "MCX", "CDS"):
+                    token = self._session.resolve_token(sym, e)
+                    if token is not None:
+                        break
+            if token is not None:
+                tokens.append(token)
+            else:
+                logger.warning(
+                    "Zerodha[%s] cannot resolve %s/%s", self.alias, sym, exch,
+                )
+
+        if not tokens:
+            return
+
+        with self._tokens_lock:
+            self._pending_tokens.extend(tokens)
+            self._subscribed_tokens.extend(tokens)
+
+        if self._ticker is None:
+            self._ticker = self._session.create_ticker()
+            if self._ticker is None:
+                return
+            self._ticker.on_ticks   = self._on_raw_ticks
+            self._ticker.on_connect = self._on_ws_connect
+            self._ticker.on_close   = self._on_ws_close
+            self._ticker.on_error   = self._on_ws_error
+            self._ticker.on_order_update = self._on_order_update
+            threading.Thread(
+                target=self._ticker.connect,
+                kwargs={"threaded": True},
+                daemon=True, name=f"KiteTicker-{self.alias}",
+            ).start()
+        else:
+            self._flush_pending_tokens()
+
+    def unsubscribe_realtime(self, symbols: list[tuple[str, str]]) -> None:
+        if self._ticker is None:
+            return
+        tokens: list[int] = []
+        for sym, exch in symbols:
+            token = self._session.resolve_token(sym, exch)
+            if token is None:
+                for e in ("NSE", "BSE", "NFO", "MCX", "CDS"):
+                    token = self._session.resolve_token(sym, e)
+                    if token is not None:
+                        break
+            if token is not None:
+                tokens.append(token)
+        if tokens:
+            try:
+                self._ticker.unsubscribe(tokens)
+            except Exception as exc:                        # pragma: no cover
+                logger.warning("unsubscribe error: %s", exc)
+            for t in tokens:
+                if t in self._subscribed_tokens:
+                    self._subscribed_tokens.remove(t)
+
+    # ── WebSocket lifecycle ──────────────────────────────────────────
+    def _on_ws_connect(self, _ws, _response) -> None:
+        """Flush pending token queue — runs on the KiteTicker thread."""
+        with self._tokens_lock:
+            self._ws_connected = True
+        self._flush_pending_tokens()
+
+    def _flush_pending_tokens(self) -> None:
+        """Drain ``_pending_tokens`` onto the ticker under the lock."""
+        if self._ticker is None:
+            return
+        with self._tokens_lock:
+            if not self._ws_connected or not self._pending_tokens:
+                return
+            tokens = list(dict.fromkeys(self._pending_tokens))
+            self._pending_tokens.clear()
+        try:
+            self._ticker.subscribe(tokens)
+            self._ticker.set_mode(self._ticker.MODE_FULL, tokens)
+            logger.info(
+                "KiteTicker[%s] flushed %d tokens", self.alias, len(tokens),
+            )
+        except Exception as exc:
+            with self._tokens_lock:
+                self._pending_tokens.extend(tokens)
+            logger.warning(
+                "KiteTicker[%s] subscribe failed (%s) — re-queued %d tokens.",
+                self.alias, exc, len(tokens),
+            )
+
+    def _on_ws_close(self, _ws, code, reason) -> None:
+        with self._tokens_lock:
+            self._ws_connected = False
+        logger.info(
+            "KiteTicker[%s] closed: %s %s", self.alias, code, reason,
+        )
+
+    def _on_ws_error(self, _ws, code, reason) -> None:
+        logger.error(
+            "KiteTicker[%s] error: %s %s", self.alias, code, reason,
+        )
+
+    def _on_order_update(self, _ws, data: dict) -> None:
+        """Forward Kite ``on_order_update`` postbacks to the exec plugin
+        through the shared session."""
+        self._session.dispatch_order_update(data)
+
+    # ── Raw tick adapter ─────────────────────────────────────────────
+    def _on_raw_ticks(self, _ws, ticks: list[dict]) -> None:
+        """Convert KiteTicker dicts → v2 :class:`Tick` and dispatch."""
+        cb = self._on_tick
+        if cb is None:
+            return
+        if logger.isEnabledFor(logging.DEBUG) and ticks:
+            tokens = [t.get("instrument_token", 0) for t in ticks]
+            logger.debug(
+                "[tick-stage1:plugin] KiteTicker[%s] batch=%d tokens=%s",
+                self.alias, len(ticks), tokens,
+            )
+        for raw in ticks:
+            token = raw.get("instrument_token", 0)
+            symbol = self._session.get_symbol_from_token(token) or str(token)
+            exchange = (
+                self._session.get_exchange_from_token(token)
+                or self._session.find_exchange(symbol)
+                or ""
+            )
+
+            cum_vol = int(raw.get("volume_traded", raw.get("volume", 0)))
+            prev = self._last_cum_volume.get(token, 0)
+            delta = max(0, cum_vol - prev) if prev > 0 else 0
+            self._last_cum_volume[token] = cum_vol
+
+            exch_ts = raw.get("exchange_timestamp") or raw.get("last_trade_time")
+            if hasattr(exch_ts, "astimezone"):
+                ts = exch_ts.astimezone(IST)
+            elif isinstance(exch_ts, (int, float)):
+                ts = datetime.fromtimestamp(exch_ts, tz=IST)
+            else:
+                ts = datetime.now(IST)
+
+            depth = raw.get("depth") or {}
+            buy = (depth.get("buy") or [{}])[0]
+            sell = (depth.get("sell") or [{}])[0]
+
+            day = raw.get("ohlc") or {}
+            d_open  = _as_float(day.get("open"))
+            d_high  = _as_float(day.get("high"))
+            d_low   = _as_float(day.get("low"))
+            d_close = _as_float(day.get("close"))
+
+            try:
+                cb(Tick(
+                    symbol=symbol,
+                    exchange=exchange,
+                    price=float(raw.get("last_price", 0)),
+                    volume=delta,
+                    timestamp=ts,
+                    bid=float(buy.get("price")) if buy.get("price") else None,
+                    ask=float(sell.get("price")) if sell.get("price") else None,
+                    day_open=d_open,
+                    day_high=d_high,
+                    day_low=d_low,
+                    day_close=d_close,
+                ))
+            except Exception:                               # pragma: no cover
+                logger.exception("zerodha on_tick raised")
+
+
+# ── Helpers ────────────────────────────────────────────────────────────
+def _as_float(v: Any) -> float | None:
+    """Coerce a KiteTicker raw value to ``float`` or ``None``."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _segment_for(exchange: str, instrument_type: str) -> str:
+    """Map (exchange, instrument-type) → v2 segment string."""
+    if exchange in ("NSE", "BSE") and instrument_type in ("EQ", "BE"):
+        return f"{exchange}_EQ"
+    if exchange == "NFO":
+        return "NFO"
+    if exchange == "MCX":
+        return "MCX"
+    if exchange == "CDS":
+        return "CDS"
+    return exchange

@@ -1,0 +1,52 @@
+# delivery_exit.txt — EOD Delivery Position Exit Strategy
+# Exits positions where EMA alignment breaks (close > prev_close > EMA50 > EMA150 > EMA200)
+#
+# Recommended schedule:
+#   Watchlist: "holdings"  (your current positions)
+#   Broker:    ac_1 (your delivery account)
+#   Frequency: EOD (15:10 IST daily)
+#   Product:   CNC
+#   auto_execute: False (review signals first)
+
+import talib
+from opentrader.strategy.base import StrategyBase
+
+class Strategy(StrategyBase):
+    name = "Delivery Exit"
+    version = "1.0"
+    description = "Exit delivery positions if EMA 50/150/200 alignment breaks"
+    parameters = {
+        "ema_fast": 50,
+        "ema_mid": 150,
+        "ema_slow": 200,
+    }
+
+    def run(self, ctx):
+        signals = []
+        for symbol in ctx.symbols:
+            df = ctx.ohlcv(symbol, "D")
+            if len(df) < self.parameters["ema_slow"] + 5:
+                ctx.log(f"Skipping {symbol} — not enough data")
+                continue
+
+            close = df["close"].values
+            ema_fast = talib.EMA(close, self.parameters["ema_fast"])
+            ema_mid  = talib.EMA(close, self.parameters["ema_mid"])
+            ema_slow = talib.EMA(close, self.parameters["ema_slow"])
+
+            latest_close = close[-1]
+            prev_close   = close[-2]
+
+            # Perfect alignment: latest > prev > EMA50 > EMA150 > EMA200
+            aligned = (
+                latest_close > prev_close
+                and prev_close > ema_fast[-1]
+                and ema_fast[-1] > ema_mid[-1]
+                and ema_mid[-1] > ema_slow[-1]
+            )
+
+            if not aligned:
+                signals.append(ctx.exit(symbol, source="EMA_Alignment_Break"))
+                ctx.log(f"EXIT signal: {symbol} — EMA alignment broken")
+
+        return signals

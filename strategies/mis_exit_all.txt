@@ -1,0 +1,63 @@
+# mis_exit_all.txt — Force-close every open MIS position before broker squareoff
+#
+# Why this strategy exists:
+#   Indian-equity intraday (MIS) brokers run an auto-squareoff window at
+#   ~15:15-15:20 IST. If you leave a MIS position open into that window,
+#   the broker closes it at worst-of-day price AND stamps a per-scrip
+#   penalty. This strategy gets in first with a graceful MARKET exit at
+#   15:10, ten minutes before that.
+#
+# Recommended schedule:
+#   Watchlist: any (the strategy iterates ctx.positions, not ctx.symbols)
+#   Broker:    your intraday account (e.g. ac_2)
+#   Frequency: EOD (15:10 IST daily — DO NOT change)
+#   Product:   MIS
+#   Budget:    passthrough (the strategy supplies the exact qty to close)
+#   auto_execute: True (this is the whole point)
+#
+# Why passthrough, not sandbox:
+#   ctx.exit(symbol) would emit a qty=0 EXIT signal; the sizer would try to
+#   size it and — prior to the 7.1c guard — could open a fresh short.
+#   We sidestep the whole path by sending ctx.sell(symbol, quantity=N) with
+#   N equal to the actual open position, which takes the strategy-override
+#   branch of the sizer and bypasses budget math.
+
+from opentrader.strategy.base import StrategyBase
+
+
+class Strategy(StrategyBase):
+    name = "MIS Auto Square-Off"
+    version = "1.0"
+    description = (
+        "Force-close all MIS positions 10 minutes before the broker's "
+        "auto-squareoff window."
+    )
+
+    def run(self, ctx):
+        signals = []
+        for symbol, pos_list in ctx.positions.items():
+            for pos in pos_list:
+                if pos.get("product") != "MIS":
+                    continue
+                qty = int(pos.get("quantity") or 0)
+                if qty == 0:
+                    continue
+
+                # Long → SELL, short → BUY. Always send explicit qty so the
+                # sizer's strategy-override branch fires (budget is ignored).
+                if qty > 0:
+                    signals.append(
+                        ctx.sell(
+                            symbol, quantity=qty, product="MIS",
+                            source="MIS_SQUAREOFF",
+                        )
+                    )
+                else:
+                    signals.append(
+                        ctx.buy(
+                            symbol, quantity=abs(qty), product="MIS",
+                            source="MIS_SQUAREOFF",
+                        )
+                    )
+                ctx.log(f"Squaring off MIS {symbol} qty={qty}")
+        return signals

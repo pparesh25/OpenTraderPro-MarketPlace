@@ -1,0 +1,49 @@
+# adx_ema_intraday.txt — ADX + EMA Intraday BUY Strategy
+# Buys when ADX > threshold AND EMA20 > EMA50 AND price > EMA20
+#
+# Recommended schedule:
+#   Watchlist: "intraday_watchlist"
+#   Broker:    ac_2 (your intraday account)
+#   Frequency: 5min (during market hours)
+#   Product:   MIS
+#   auto_execute: False (review signals first)
+
+import talib
+from opentrader.strategy.base import StrategyBase
+
+class Strategy(StrategyBase):
+    name = "ADX EMA Intraday"
+    version = "1.0"
+    description = "Buy when ADX > threshold and EMA20 > EMA50 and price above EMA20"
+    parameters = {
+        "adx_period": 14,
+        "ema_fast": 20,
+        "ema_slow": 50,
+        "adx_threshold": 25,
+    }
+
+    def run(self, ctx):
+        signals = []
+        for symbol in ctx.symbols:
+            df = ctx.ohlcv(symbol, "5m")
+            if len(df) < self.parameters["ema_slow"] + 5:
+                continue
+
+            close = df["close"].values
+            high  = df["high"].values
+            low   = df["low"].values
+
+            adx   = talib.ADX(high, low, close, self.parameters["adx_period"])
+            ema_f = talib.EMA(close, self.parameters["ema_fast"])
+            ema_s = talib.EMA(close, self.parameters["ema_slow"])
+
+            strong_trend = adx[-1] > self.parameters["adx_threshold"]
+            ema_aligned  = ema_f[-1] > ema_s[-1]
+            price_above  = close[-1] > ema_f[-1]
+
+            if strong_trend and ema_aligned and price_above:
+                signals.append(
+                    ctx.buy(symbol, price=close[-1], source="ADX_EMA_Cross")
+                )
+
+        return signals

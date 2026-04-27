@@ -1,0 +1,38 @@
+
+# vwap.txt — Volume Weighted Average Price
+# ============================================================
+# OpenTrader-Pro custom indicator file.
+# Rules:
+#   - Class name MUST be 'Indicator'
+#   - Must subclass BaseIndicator
+#   - talib, pandas (pd), numpy (np) are pre-imported by Python
+#   - You can also 'import pandas_ta as ta' if installed
+# ============================================================
+
+import numpy as np
+import pandas as pd
+from opentrader.indicators.base import BaseIndicator
+
+
+class Indicator(BaseIndicator):
+    name = "VWAP"
+    short_name = "VWAP"
+    description = "Volume Weighted Average Price — intraday anchor."
+    overlay_on_price = True
+
+    def __init__(self):
+        super().__init__()
+        self.parameters = {}
+        self.add_line("vwap", "VWAP", color="#FF9800")
+
+    def calculate(self, df: pd.DataFrame) -> None:
+        typical = (
+            self._col(df, "high")
+            + self._col(df, "low")
+            + self._col(df, "close")
+        ) / 3
+        volume = self._col(df, "volume")
+        cumvol = np.cumsum(volume)
+        # Avoid division by zero on zero-volume bars
+        cumvol = np.where(cumvol == 0, np.nan, cumvol)
+        self.lines["vwap"].data = np.cumsum(typical * volume) / cumvol
