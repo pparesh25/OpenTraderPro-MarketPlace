@@ -41,5 +41,38 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install 'cryptography>=42.0'
 
+      # T-S11-B / F-S11-2 — drift detection for the embedded marketplace
+      # public key. The same MARKETPLACE_PUBLIC_KEY_B64 constant lives in
+      # two repos (this script + opentrader/connectors_v2/
+      # marketplace_public_key.py in the app). They MUST stay
+      # byte-identical or rotation breaks silently in opposite
+      # directions. The script fetches the app's source and asserts the
+      # local constant matches.
+      #
+      # Modes:
+      # - public app repo → unauthenticated raw GitHub fetch, works
+      #   without secrets.
+      # - private app repo → authenticated GitHub API fetch using
+      #   OPENTRADER_PRO_READ_TOKEN (set as a repo secret with read
+      #   scope on pparesh25/OpenTrader-Pro).
+      #
+      # Exit codes: 0 = match, 1 = drift (hard fail), 2 = fetch failure
+      # (soft fail, logged as warning). The soft-fail path keeps a
+      # transient GitHub outage from breaking marketplace publishes.
+      - name: Check marketplace key drift vs app
+        env:
+          OPENTRADER_PRO_READ_TOKEN: ${{ secrets.OPENTRADER_PRO_READ_TOKEN }}
+        run: |
+          python .github/scripts/check_app_key_drift.py
+          rc=$?
+          if [ "$rc" = "0" ]; then
+            echo "Drift check passed."
+          elif [ "$rc" = "2" ]; then
+            echo "::warning::Drift check skipped (fetch failure). Marketplace verify still runs."
+          else
+            echo "::error::Drift check failed — marketplace key does not match app key."
+            exit 1
+          fi
+
       - name: Verify all .txt signatures
         run: python .github/scripts/verify_signatures.py
