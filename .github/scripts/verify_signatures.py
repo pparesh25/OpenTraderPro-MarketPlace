@@ -48,8 +48,15 @@ _ED25519_SIGNATURE_SIZE = 64
 
 def verify_one(content: bytes, sig_b64: str, pub_key: bytes) -> bool:
     """Verify a single (content, sig, pubkey) triple. Never raises."""
+    # T-S11-A / F-S11-1 — strict base64 decode. ``validate=False``
+    # silently strips characters outside the base64 alphabet, which
+    # for cryptographic material means an attacker can prefix garbage
+    # like ``!@#`` to shift the decoded byte alignment. Strict mode
+    # (``validate=True``) rejects any non-alphabet character; a .sig
+    # file MUST contain only the 88-char base64 signature plus
+    # optional whitespace (``.strip()`` at the call site).
     try:
-        sig = base64.b64decode(sig_b64.strip(), validate=False)
+        sig = base64.b64decode(sig_b64.strip(), validate=True)
     except (binascii.Error, ValueError):
         return False
     if len(sig) != _ED25519_SIGNATURE_SIZE:
