@@ -61,9 +61,20 @@ def verify_one(content: bytes, sig_b64: str, pub_key: bytes) -> bool:
         return False
     if len(sig) != _ED25519_SIGNATURE_SIZE:
         return False
+    # F-S11-10 — split into two branches matching the app-side
+    # ``signature_verifier.py`` shape. ``Exception`` already catches
+    # ``InvalidSignature`` so the tuple form was redundant; the
+    # split-branch form gives CI logs a granular diagnostic
+    # (signature mismatch vs unexpected crypto error) without
+    # changing the verify outcome.
     try:
         Ed25519PublicKey.from_public_bytes(pub_key).verify(sig, content)
-    except (InvalidSignature, Exception):
+    except InvalidSignature:
+        return False
+    except Exception:                                  # noqa: BLE001
+        # Belt-and-braces: any other crypto error (bad public-key
+        # bytes, library-version mismatch) → not verified rather
+        # than crashing the workflow.
         return False
     return True
 
