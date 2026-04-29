@@ -28,11 +28,29 @@ jobs:
     name: Verify .txt signatures
     runs-on: ubuntu-latest
     steps:
+      # T-S11-C / F-S11-6 — pin upstream actions to commit SHAs rather
+      # than mutable major-version tags. Per OpenSSF best practice for
+      # security-critical CI: an attacker who compromises actions/checkout
+      # (account hijack, dependency-confusion, malicious maintainer
+      # commit) and pushes a new commit to the v4 tag would otherwise
+      # run their code against this workflow on the next run, with
+      # read access to the repo + GITHUB_TOKEN. SHA-pinning means the
+      # workflow runs the exact code we audited; tag movements are
+      # ignored.
+      #
+      # Upgrade procedure (also documented in SECURITY.md):
+      #   1. Pick a release tag from the action's GitHub repo.
+      #   2. Resolve the commit SHA via:
+      #        gh api repos/actions/checkout/git/refs/tags/v4.4.0
+      #   3. Update the SHA below + the trailing # comment to the new
+      #      version. Audit the diff between old and new commits.
+      # Or run Dependabot with `package-ecosystem: github-actions` for
+      # automated SHA bumps with audit-friendly PRs.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: '3.13'
 

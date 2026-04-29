@@ -1,0 +1,26 @@
+# T-S11-C / F-S11-6 — automated SHA bumps for SHA-pinned GitHub Actions.
+#
+# The verify-signatures workflow pins actions/checkout and
+# actions/setup-python to specific commit SHAs rather than mutable
+# major-version tags (per OpenSSF best practice for security-critical
+# CI). Dependabot watches each pinned action's release feed and opens a
+# PR when a new tagged release lands, bumping the SHA + the version
+# comment. The maintainer audits the action diff in the PR before
+# merging.
+#
+# Monthly cadence keeps the audit load light while still catching
+# security releases within a reasonable window. Bump to weekly if the
+# action's ecosystem starts shipping security fixes more frequently.
+
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "ci"

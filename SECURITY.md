@@ -153,6 +153,42 @@ These are tracked in the main app repository. Versions are not yet released.
 
 ---
 
+## CI / supply chain — SHA-pinned GitHub Actions
+
+The `verify-signatures.yml` workflow pins every upstream action
+(`actions/checkout`, `actions/setup-python`, …) to a full commit SHA
+rather than a mutable major-version tag. The threat model is
+dependency-confusion / maintainer-account compromise on those upstream
+repos: an attacker pushing a new commit and moving the `v4` tag to it
+would otherwise execute their code in the marketplace's CI on the next
+run, with read access to the repo and `GITHUB_TOKEN`.
+
+Pinning to a SHA closes that window — the workflow runs exactly the
+audited code; tag-pointer movements are ignored. Dependabot
+(`.github/dependabot.yml`) opens a PR each month when a new tagged
+release lands so the SHA bumps are visible + auditable rather than
+silent.
+
+### Upgrade procedure
+
+When a new release of a pinned action ships:
+
+1. Pick the release tag (e.g. `v4.4.0` for `actions/checkout`).
+2. Resolve the commit SHA:
+
+   ```bash
+   gh api repos/actions/checkout/git/refs/tags/v4.4.0 --jq '.object.sha'
+   ```
+
+3. Update the SHA in `.github/workflows/verify-signatures.yml` plus
+   the trailing `# v4.x.x` comment.
+4. Audit the diff between old and new commits before merging.
+
+Dependabot does steps 1–3 automatically; the maintainer's job is the
+step-4 audit.
+
+---
+
 ## Reporting a security issue
 
 If you find a vulnerability — in a marketplace file, in the app's loader, or in the marketplace process itself — please **do not open a public issue**. Email the maintainer directly (see the maintainer's GitHub profile at <https://github.com/pparesh25> for contact). Include:
