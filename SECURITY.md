@@ -94,6 +94,36 @@ import verify_file_signature`.)
 
 These are tracked in the main app repository. Versions are not yet released.
 
+### Signature format versions
+
+The marketplace ships Ed25519 detached signatures with an optional
+on-disk format header. Two versions are currently supported:
+
+| Version | On-disk shape | Signature is over |
+|---|---|---|
+| **v0** (legacy) | bare base64 in `<file>.sig` | file content only |
+| **v1** (recommended) | `# sig-format: v1\n<base64>` | basename + `\n` + content |
+
+v1 binds the signature to the file's basename so a rename+swap inside
+the marketplace cache (an attacker pointing a verified `.sig` at a
+different file by renaming) fails verification (F-S11-7). Both
+verifiers — the OpenTrader Pro app and this CI workflow — accept
+both formats during the migration window. Unknown format versions
+are rejected as malformed rather than silently downgrading.
+
+Re-signing existing files to v1 is a maintainer step (requires the
+offline private key). The app's `sign` CLI defaults to v1:
+
+```bash
+python -m opentrader.connectors_v2.sign \
+    --key-password-stdin \
+    --force \
+    /path/to/marketplace_clone   # re-signs every .txt with v1
+```
+
+Once every shipped file is v1, the v0 fallback can be dropped
+in a future major release.
+
 ### Phase M1 — Cryptographic signing ✅ DONE 2026-04-28
 
 - Maintainer holds an Ed25519 private key offline at
