@@ -81,8 +81,14 @@ jobs:
         env:
           OPENTRADER_PRO_READ_TOKEN: ${{ secrets.OPENTRADER_PRO_READ_TOKEN }}
         run: |
-          python .github/scripts/check_app_key_drift.py
-          rc=$?
+          # F-S11-2 follow-up — bash runs with `set -e` by default in
+          # GitHub Actions, so a non-zero python exit aborts BEFORE
+          # `rc=$?` reads it. ``|| rc=$?`` captures the exit code
+          # without tripping the early abort, then the elif branch
+          # below cleanly soft-fails on exit 2 (fetch outage / private
+          # app repo without a configured token).
+          rc=0
+          python .github/scripts/check_app_key_drift.py || rc=$?
           if [ "$rc" = "0" ]; then
             echo "Drift check passed."
           elif [ "$rc" = "2" ]; then
