@@ -8,7 +8,36 @@ This repository ships **plugins** (broker connectors), **strategies** (signal lo
 
 ## ⚠️ Read SECURITY.md before installing
 
-Every file in this repository is **executable Python code** that the OpenTrader-Pro app runs with full user privileges. Treat each install with the same caution as installing any third-party software. See [SECURITY.md](SECURITY.md) for the threat model and the upcoming integrity-verification roadmap.
+Every file in this repository is **executable Python code** that the OpenTrader-Pro app runs with full user privileges. Treat each install with the same caution as installing any third-party software. See [SECURITY.md](SECURITY.md) for the full threat model and verification details.
+
+---
+
+## Philosophy
+
+The marketplace is built around three principles. Read these before you install anything.
+
+### 1. Source-readable is the primary defence
+
+Every `.txt` file in this repository is **plain Python source**. No binaries, no obfuscation, no minification, no network-fetched code at import time. You can open any file in a text editor and read exactly what it does before installing it. This is the contract — opaqueness is incompatible with the marketplace.
+
+### 2. Cryptographic signing is *defence-in-depth*, not a substitute for review
+
+The marketplace ships **Ed25519 signatures** for every file (Phase M1, done 2026-04-28). The OpenTrader Pro app verifies each signature against an embedded public key before loading the file, and a GitHub Action verifies signatures on every commit + PR. The cryptography is properly set up, end-to-end tested, and working in production today.
+
+**However** — signing only proves that **the maintainer** signed the file. It does NOT prove the maintainer's code is benign, nor that the maintainer's intent matches yours. A signed file from a compromised maintainer key would still verify; a signed file written carelessly would still verify.
+
+> **Cryptographic verification is an additional precaution taken by the developer to defend against tampering between this repo and your disk. It is NOT a substitute for you reading the code.**
+
+### 3. Reviewing downloaded files is *your* responsibility too
+
+Trading code talks to your broker, places real-money orders, and reads your secrets. The marketplace ships small, single-purpose, plain-Python files specifically so you *can* read them — typically a few hundred lines each. Open every plugin / strategy / indicator before installing and confirm:
+
+- It does what its README claims it does.
+- It only talks to the brokers + endpoints you expect.
+- It doesn't read or write paths outside its own scope.
+- Its dependencies are libraries you already trust.
+
+If you can't read Python comfortably, ask someone who can — or stick to reading [SECURITY.md](SECURITY.md) and accepting the trust-the-maintainer trade-off explicitly. Either is a valid choice. Installing without reading and *assuming* the signature makes it safe is not.
 
 ---
 
@@ -39,34 +68,109 @@ OpenTraderPro-MarketPlace/
 
 ---
 
-## Quick install
+## Where downloaded files live on your system
 
-The OpenTrader-Pro app reads from these user-home directories on startup:
+The OpenTrader Pro app uses **two separate directories** for marketplace content vs. files you author yourself. The split is deliberate — it lets the app load the verified marketplace by default and isolate your own work behind an explicit toggle.
 
-| Type | App-home directory |
-|---|---|
-| Data plugins | `~/.opentrader-pro/plugins/data/` |
-| Exec plugins | `~/.opentrader-pro/plugins/exec/` |
-| Strategies | `~/.opentrader-pro/strategies/` |
-| Indicators | `~/.opentrader-pro/indicators/{averages,bands,oscillators,custom}/` |
+| Directory | Purpose | Loaded by default? |
+|---|---|---|
+| `~/.opentrader-pro/marketplace_cache/` | Files installed by the in-app marketplace installer. Every file is signed and verified at load. Files are written read-only (`chmod 0o444`) on POSIX. | ✅ Always |
+| `~/.opentrader-pro/plugins/`, `strategies/`, `indicators/` | Files you authored, sideloaded, or copied manually. Unsigned files load with a WARNING; signed-but-tampered files load with a CRITICAL warning. | ❌ Only when **Developer Mode** is on |
 
-Mirror the repo path → app-home path for each file you want:
+Inside each root, the layout mirrors this repository:
 
-```bash
-# Example: install Zerodha (kite_broker) plugin
-cp plugins/data/kite_broker_data.txt ~/.opentrader-pro/plugins/data/
-cp plugins/exec/kite_broker_exec.txt ~/.opentrader-pro/plugins/exec/
-
-# Example: install a strategy
-cp strategies/delivery_exit.txt ~/.opentrader-pro/strategies/
-
-# Example: install the VWAP indicator
-cp indicators/averages/vwap.txt ~/.opentrader-pro/indicators/averages/
+```
+~/.opentrader-pro/marketplace_cache/
+├── plugins/
+│   ├── data/        ← copied from this repo's plugins/data/
+│   └── exec/        ← copied from this repo's plugins/exec/
+├── strategies/      ← copied from this repo's strategies/
+└── indicators/
+    ├── averages/    ← copied from this repo's indicators/averages/
+    ├── bands/
+    ├── oscillators/
+    └── custom/
 ```
 
-After copying, restart the app. Plugins prompt a one-time consent dialog; strategies and indicators load directly (a consent gate for them is planned — see SECURITY.md).
+The user-edit roots (`~/.opentrader-pro/{plugins,strategies,indicators}/`) follow the same shape but are seeded with `_template.txt` examples on first launch instead of marketplace content.
 
-The Accounts panel "Get example plugins" button will eventually open this repository in your browser; an in-app downloader is on the roadmap.
+---
+
+## Install — preferred path: in-app installer (Phase M3)
+
+The OpenTrader Pro app ships an in-app installer as of 2026-04-28 (V3 §M3). This is the recommended way to consume the marketplace.
+
+**Inside the app:** open the **Accounts** panel → click **"Install marketplace files"**.
+
+The installer fetches the latest marketplace zip from GitHub, verifies every `.txt` against its embedded `.sig` using the embedded public key, rejects unsigned / tampered / mis-located entries, and installs the verified files into `~/.opentrader-pro/marketplace_cache/` read-only. A "Browse on GitHub →" companion button opens this repo so you can review before installing.
+
+Headless / scripted equivalent:
+
+```bash
+python -m opentrader.connectors_v2.marketplace_install
+# or against a local clone of this repo:
+python -m opentrader.connectors_v2.marketplace_install --source /path/to/clone
+```
+
+After install, restart the app. Plugins prompt a one-time consent dialog (V3 R1); strategies and indicators have an analogous consent gate (V3 §S3) — both default to off until you click "Allow".
+
+---
+
+## Install — fallback: manual copy
+
+If the in-app installer is unavailable (offline machine, custom directory layout, you want to inspect every file before copying), fall through to manual `cp`:
+
+```bash
+git clone https://github.com/pparesh25/OpenTraderPro-MarketPlace
+cd OpenTraderPro-MarketPlace
+
+# Verify signatures locally before copying — see SECURITY.md
+pip install cryptography
+python .github/scripts/verify_signatures.py
+# Expected: "28 verified, 0 failed"
+
+# Then copy whatever you want into the marketplace_cache:
+cp plugins/data/kite_broker_data.txt   ~/.opentrader-pro/marketplace_cache/plugins/data/
+cp plugins/data/kite_broker_data.txt.sig ~/.opentrader-pro/marketplace_cache/plugins/data/
+cp plugins/exec/kite_broker_exec.txt   ~/.opentrader-pro/marketplace_cache/plugins/exec/
+cp plugins/exec/kite_broker_exec.txt.sig ~/.opentrader-pro/marketplace_cache/plugins/exec/
+
+cp strategies/delivery_exit.txt        ~/.opentrader-pro/marketplace_cache/strategies/
+cp strategies/delivery_exit.txt.sig    ~/.opentrader-pro/marketplace_cache/strategies/
+
+cp indicators/averages/vwap.txt        ~/.opentrader-pro/marketplace_cache/indicators/averages/
+cp indicators/averages/vwap.txt.sig    ~/.opentrader-pro/marketplace_cache/indicators/averages/
+```
+
+**Always copy the `.sig` sibling alongside the `.txt`.** Without the signature the file refuses to load from the marketplace cache. (User-edit dirs accept unsigned files in Developer Mode.)
+
+---
+
+## Developer Mode
+
+**Off by default.** Developer Mode is a Settings toggle (V3 §M2, done 2026-04-28) that controls whether the app loads files from the user-edit dirs (`~/.opentrader-pro/plugins/`, `strategies/`, `indicators/`).
+
+| State | Loads `marketplace_cache/`? | Loads `~/.opentrader-pro/{plugins,strategies,indicators}/`? |
+|---|---|---|
+| **OFF** (default) | ✅ Yes — verified signatures only | ❌ Skipped entirely |
+| **ON** (developer) | ✅ Yes | ✅ Yes — unsigned files load with WARNING |
+
+### When to enable Developer Mode
+
+- You're authoring your own plugin / strategy / indicator from a `_template.txt`.
+- You've forked this marketplace + have local edits you want to test before submitting a PR.
+- You're sideloading a plugin from a third party that is NOT in this marketplace (you've reviewed the source yourself and accepted the risk).
+
+### When NOT to enable it
+
+- You only want to use the official marketplace files. Leaving Developer Mode OFF guarantees the app cannot load anything you didn't explicitly install via the verified installer.
+- You're handing the laptop to someone less technical. Developer Mode raises the surface area of "what code can run inside the app" — keep it off if you're not the only person at the keyboard.
+
+### Where to find it
+
+Settings → **Marketplace** tab → "Allow custom plugins / strategies / indicators (developer mode)".
+
+The app remembers your choice. The toggle is sticky — first-boot smart-default reads from disk state (existing user files → ON, empty → OFF) so existing users aren't surprised.
 
 ---
 
@@ -162,11 +266,21 @@ These files are example/reference plugins distributed under GPL-3.0. You are fre
 
 ## Roadmap
 
-- **In-app downloader** (Phase M3 in main app): "Get example plugins" button currently opens this repo in a browser; a future release will fetch + install in-app.
-- **Cryptographic signing** (Phase M1): each `.txt` will ship with an Ed25519 `.sig` sibling file; the app will verify signatures at load time so a tampered file refuses to load.
-- **Trusted-only mode** (Phase M2): a Settings toggle defaults to "marketplace files only"; user-authored files require explicit opt-in (developer mode).
-- **Consent gate for strategies + indicators** (Phase S3): close the existing security gap where strategies/indicators in `~/.opentrader-pro/{strategies,indicators}/` load with no user confirmation. Plugins have this gate since V3 R1.
-- **Authoring guides**: dedicated `strategy_authoring_guide.md` + `indicator_authoring_guide.md` (plugins already have one).
+### Done
+
+- ✅ **Phase M1 — Cryptographic signing** (2026-04-28): Ed25519 `.sig` sibling for every `.txt`; app verifies at load; CI verifies on every commit.
+- ✅ **Phase M2 — Trusted-only mode + Developer-mode toggle** (2026-04-28): default-on marketplace_cache + opt-in user-edit dirs. See "Developer Mode" above.
+- ✅ **Phase M3 — In-app marketplace installer** (2026-04-28): "Install marketplace files" button in the Accounts panel. Headless CLI via `python -m opentrader.connectors_v2.marketplace_install`.
+- ✅ **Phase S3 — Consent gate for strategies + indicators** (2026-04-28): one-time consent dialog covers all three categories; user-edit dirs only load when consent is recorded.
+- ✅ **Phase M4 — Marketplace public flip** (2026-04-29): this repository is now public.
+
+### Planned (no committed dates)
+
+- **Phase S1 — Optional marker lines for strategies + indicators** (~2-3h, nice-to-have, backward-compatible): make the `.txt` self-identifying without requiring a contract change.
+- **Phase S2 — Validator CLIs for strategies + indicators** (~8-12h): mirror the plugin validator's 8-step pipeline. Plugins already have `python -m opentrader.connectors_v2.validate`.
+- **Phase S4 — Authoring guides for strategies + indicators** (~4-6h): dedicated `strategy_authoring_guide.md` + `indicator_authoring_guide.md` siblings to the existing plugin guide.
+- **Auto-update from M3** (deferred to v1.1): the M3 installer is manual today; a future release will check for newer marketplace versions on a cadence and prompt to update.
+- **Key rotation infrastructure** (V4): currently a single embedded public key with no expiry or revocation. Multi-key + rotation overlap planned for V4.
 
 The roadmap is tracked in the main app repository.
 
