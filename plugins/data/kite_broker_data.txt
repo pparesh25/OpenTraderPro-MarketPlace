@@ -916,11 +916,16 @@ class DataPlugin(DataPluginV2):
             buy = (depth.get("buy") or [{}])[0]
             sell = (depth.get("sell") or [{}])[0]
 
+            # F-S1-6 — Kite's ``ohlc.close`` is the previous session's
+            # close (yesterday's), not today's in-progress close. Map it
+            # to ``Tick.prev_close``; the local var name keeps ``close``
+            # mirroring Kite's API field for traceability when reading
+            # raw KiteTicker payloads alongside this code.
             day = raw.get("ohlc") or {}
-            d_open  = _as_float(day.get("open"))
-            d_high  = _as_float(day.get("high"))
-            d_low   = _as_float(day.get("low"))
-            d_close = _as_float(day.get("close"))
+            d_open       = _as_float(day.get("open"))
+            d_high       = _as_float(day.get("high"))
+            d_low        = _as_float(day.get("low"))
+            d_prev_close = _as_float(day.get("close"))
 
             try:
                 cb(Tick(
@@ -934,7 +939,11 @@ class DataPlugin(DataPluginV2):
                     day_open=d_open,
                     day_high=d_high,
                     day_low=d_low,
-                    day_close=d_close,
+                    # F-S1-6 — was ``day_close=...``; the app-side rename
+                    # made construction with the old name a hard break
+                    # (TypeError every tick) so a populator can't silently
+                    # ship the wrong-meaning value.
+                    prev_close=d_prev_close,
                 ))
             except Exception:                               # pragma: no cover
                 logger.exception("zerodha on_tick raised")
