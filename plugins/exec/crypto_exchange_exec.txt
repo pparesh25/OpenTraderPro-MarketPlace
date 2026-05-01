@@ -969,7 +969,22 @@ class BinanceUserDataWorker:
 
     # ── Supervisor loop ──────────────────────────────────────────────────
     def _run(self) -> None:
-        """Reconnect-and-keepalive loop. Owns the worker thread."""
+        """Reconnect-and-keepalive loop. Owns the worker thread.
+
+        F-S2-bin-410 — when ``_provision_listen_key`` hits a permanently-
+        gone endpoint (Binance has been migrating user-data streams away
+        from the legacy REST/listenKey model toward WebSocket-API-based
+        auth; some segments / regions return ``410 Gone`` on the legacy
+        endpoint), we used to retry forever with exponential backoff
+        capped at 60s — flooding the log every minute and wasting
+        bandwidth through the SSH tunnel. Now we detect the
+        terminal-failure signature, log ONCE at WARNING, and exit the
+        loop. The OrderTracker polling fallback (already wired in
+        main.py) keeps populating the trade journal — so paper trading
+        and order-status tracking continue working without the
+        push-channel; the only loss is sub-second latency on order
+        execution reports, which paper trading doesn't need anyway.
+        """
         backoff = self.RECONNECT_INITIAL_BACKOFF_S
         while not self._stopped.is_set():
             try:
@@ -980,6 +995,23 @@ class BinanceUserDataWorker:
                     backoff = self.RECONNECT_INITIAL_BACKOFF_S
                 backoff = self._sleep_with_backoff(backoff, "WS closed")
             except Exception as exc:                       # noqa: BLE001
+                # F-S2-bin-410 — terminal-failure detection. ``410 Gone``
+                # from the listenKey endpoint means the URL is sunset
+                # for this segment; retrying won't help.
+                msg = str(exc)
+                if "410 Gone" in msg or "410</title>" in msg:
+                    logger.warning(
+                        "BinanceUserDataWorker[%s/%s] giving up — "
+                        "Binance returned 410 Gone for the listen-key "
+                        "endpoint (legacy user-data-stream REST has "
+                        "been deprecated for this segment). Falling "
+                        "back to OrderTracker polling for execution "
+                        "reports. To re-enable the push channel, the "
+                        "plugin needs a migration to the WebSocket API "
+                        "auth flow — tracked at F-S2-bin-410.",
+                        self._alias(), self._segment,
+                    )
+                    return
                 logger.warning(
                     "BinanceUserDataWorker[%s/%s] cycle raised %s — "
                     "reconnecting after %.1fs",
@@ -1704,16 +1736,33 @@ class ExecPlugin(ExecPluginV2):
         if client is None:
             return []
         out: list[OrderRecord] = []
+        # F-S2-bin-perm — same denied-segment cache as get_positions().
+        denied = getattr(self._session, "_segment_perm_denied", None)
         for segment in SUPPORTED_SEGMENTS:
+            if denied is not None and segment in denied:
+                continue
             method_name = _METHODS[segment]["open_orders"]
             try:
                 with self._session.api_lock:
                     orders = getattr(client, method_name)() or []
             except Exception as exc:
-                logger.warning(
-                    "Binance[%s] %s open_orders failed: %s",
-                    self.alias, segment, exc,
-                )
+                msg = str(exc)
+                if "-2015" in msg or "permissions for action" in msg:
+                    if denied is None:
+                        denied = set()
+                        self._session._segment_perm_denied = denied  # type: ignore[attr-defined]
+                    denied.add(segment)
+                    logger.warning(
+                        "Binance[%s] %s open_orders skipped permanently — "
+                        "API key lacks %s permission (code -2015).",
+                        self.alias, segment,
+                        "Futures" if segment in (USDM, COINM) else segment,
+                    )
+                else:
+                    logger.warning(
+                        "Binance[%s] %s open_orders failed: %s",
+                        self.alias, segment, exc,
+                    )
                 continue
             for o in orders:
                 out.append(_order_to_record(o, segment))
@@ -1752,18 +1801,42 @@ class ExecPlugin(ExecPluginV2):
             ))
 
         # Futures (USDM + COINM): the positions endpoints return rich data.
+        # F-S2-bin-perm — skip a segment whose previous call returned
+        # ``-2015 Invalid API-key, IP, or permissions`` (typically because
+        # the API key has Read-only / Spot-only permissions and the user
+        # never enabled Futures). Avoids the one-warning-per-poll-cycle
+        # log spam on read-only setups (paper trading / data-feed-only).
+        denied = getattr(self._session, "_segment_perm_denied", None)
         for segment in (USDM, COINM):
             method_name = _METHODS[segment].get("positions")
             if not method_name:
+                continue
+            if denied is not None and segment in denied:
                 continue
             try:
                 with self._session.api_lock:
                     rows = getattr(client, method_name)() or []
             except Exception as exc:
-                logger.warning(
-                    "Binance[%s] %s positions failed: %s",
-                    self.alias, segment, exc,
-                )
+                # Detect the read-only-key signature and stop polling
+                # this segment for the rest of the session.
+                msg = str(exc)
+                if "-2015" in msg or "permissions for action" in msg:
+                    if denied is None:
+                        denied = set()
+                        self._session._segment_perm_denied = denied  # type: ignore[attr-defined]
+                    denied.add(segment)
+                    logger.warning(
+                        "Binance[%s] %s positions skipped permanently — "
+                        "API key lacks Futures permission "
+                        "(code -2015). Enable on Binance UI if you need "
+                        "futures position data; spot data is unaffected.",
+                        self.alias, segment,
+                    )
+                else:
+                    logger.warning(
+                        "Binance[%s] %s positions failed: %s",
+                        self.alias, segment, exc,
+                    )
                 continue
             for p in rows:
                 qty = _safe_float(p.get("positionAmt", 0.0))

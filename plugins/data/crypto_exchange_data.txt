@@ -62,15 +62,22 @@ try:
     from binance.client import Client
     from binance.exceptions import BinanceAPIException
     try:
-        from binance.ws.streams import BinanceSocketManager   # python-binance ≥1.0
+        from binance.ws.streams import (             # python-binance ≥1.0
+            BinanceSocketManager, ThreadedWebsocketManager,
+        )
     except ImportError:
         from binance.streams import BinanceSocketManager      # python-binance <1.0
+        try:
+            from binance import ThreadedWebsocketManager      # python-binance <1.0
+        except ImportError:                                    # pragma: no cover
+            ThreadedWebsocketManager = None                    # type: ignore[assignment,misc]
 
     BINANCE_AVAILABLE = True
 except ImportError as _bin_import_err:
     BINANCE_AVAILABLE = False
-    Client = None                      # type: ignore[assignment,misc]
-    BinanceSocketManager = None        # type: ignore[assignment,misc]
+    Client = None                            # type: ignore[assignment,misc]
+    BinanceSocketManager = None              # type: ignore[assignment,misc]
+    ThreadedWebsocketManager = None          # type: ignore[assignment,misc]
     BinanceAPIException = Exception    # type: ignore[misc,assignment]
     logger.info(
         "python-binance import failed (%s: %s) — binance plugin reports "
@@ -322,10 +329,34 @@ class BinanceSession:
 
     # ── Realtime ─────────────────────────────────────────────────────
     def create_ws_manager(self) -> object | None:
-        """Return a fresh ``BinanceSocketManager`` for spot ticker streams."""
+        """Return a fresh ``ThreadedWebsocketManager`` for spot ticker streams.
+
+        F-S2-bin-twm — pre-fix this returned ``BinanceSocketManager`` and
+        callers used the synchronous ``start_symbol_ticker_socket(symbol,
+        callback)`` API. python-binance ≥1.0 made ``BinanceSocketManager``
+        async-only (its public methods now return context managers /
+        coroutines); the synchronous-callback API moved to
+        ``ThreadedWebsocketManager``. The plugin's spot subscribe path
+        threw ``AttributeError`` ("'BinanceSocketManager' object has no
+        attribute 'start_symbol_ticker_socket'") for every symbol →
+        ``Binance[…] subscribed 0 spot symbols`` → no live ticks → no
+        chart live bars even though backfill + auth + watchlist routing
+        were all working. TWM speaks the same callback contract the
+        plugin has always used; only the call shape changed
+        (``start_symbol_ticker_socket(callback, symbol)`` — callback
+        first now).
+        """
         if self._client is None or not BINANCE_AVAILABLE:
             return None
-        return BinanceSocketManager(self._client)  # type: ignore[misc]
+        if ThreadedWebsocketManager is None:                # pragma: no cover
+            return None
+        # F-S2-bin-twm — TWM constructor takes api_key + api_secret
+        # mostly for the *user-data* socket path; for public ticker
+        # streams empty strings are accepted. The shared session has
+        # the real credentials but we don't need them here — passing
+        # the public-only constructor avoids accidentally activating
+        # signed paths via the manager.
+        return ThreadedWebsocketManager(api_key="", api_secret="")  # type: ignore[misc]
 
     # ── User-data-stream push channel (V3 §F7) ───────────────────────
     def register_user_event_handler(
@@ -691,6 +722,18 @@ class DataPlugin(DataPluginV2):
         symbols: list[tuple[str, str]],
         on_tick: Callable[[Tick], None],
     ) -> None:
+        """F-S2-bin-twm — spot ticker stream via ThreadedWebsocketManager.
+
+        Order matters with TWM: ``start()`` MUST run before the first
+        ``start_symbol_ticker_socket(...)``; the inverse (start sockets
+        first, manager second) is what the legacy ``BinanceSocketManager``
+        accepted but TWM raises ``RuntimeError`` because the worker
+        thread doesn't exist yet to attach the connection.
+
+        Argument order also flipped vs the legacy BSM API:
+          BSM (pre-1.0):   start_symbol_ticker_socket(symbol,   callback)
+          TWM (post-1.0):  start_symbol_ticker_socket(callback, symbol)
+        """
         if not self._session.is_authenticated:
             raise RuntimeError("Not authenticated.")
         self._on_tick = on_tick
@@ -698,14 +741,32 @@ class DataPlugin(DataPluginV2):
             self._bm = self._session.create_ws_manager()
             if self._bm is None:
                 return
+            # F-S2-bin-twm — start the manager BEFORE the first subscribe
+            # so its worker thread is alive to dispatch callbacks.
+            try:
+                self._bm.start()
+            except Exception as exc:                     # pragma: no cover
+                logger.warning(
+                    "Binance[%s] ws manager start failed: %s — "
+                    "no live ticks until next subscribe attempt.",
+                    self.alias, exc,
+                )
+                self._bm = None
+                return
 
         for sym, _exch in symbols:
             u = sym.upper()
             if u in self._conn_keys:
                 continue
             try:
+                # F-S2-bin-twm — callback first, symbol second (TWM
+                # signature). The legacy BSM order silently passed
+                # ``symbol`` as ``callback`` causing a runtime
+                # AttributeError on dispatch (or worse, infinite
+                # recursion on str().__call__()).
                 key = self._bm.start_symbol_ticker_socket(
-                    u.lower(), self._on_ticker_message,
+                    callback=self._on_ticker_message,
+                    symbol=u.lower(),
                 )
                 self._conn_keys[u] = key
             except Exception as exc:                     # pragma: no cover
@@ -714,10 +775,6 @@ class DataPlugin(DataPluginV2):
                     self.alias, u, exc,
                 )
 
-        try:
-            self._bm.start()
-        except Exception as exc:                         # pragma: no cover
-            logger.debug("Binance[%s] ws manager start failed: %s", self.alias, exc)
         logger.info(
             "Binance[%s] subscribed %d spot symbols",
             self.alias, len(self._conn_keys),
@@ -741,10 +798,20 @@ class DataPlugin(DataPluginV2):
     def _teardown_ws(self) -> None:
         if self._bm is not None:
             try:
-                self._bm.close()
+                # F-S2-bin-twm — TWM uses ``stop()``; the legacy BSM
+                # used ``close()`` which doesn't exist on TWM. Try
+                # ``stop()`` first, fall back for any non-TWM manager
+                # a future plugin variant might inject.
+                stopper = (
+                    getattr(self._bm, "stop", None)
+                    or getattr(self._bm, "close", None)
+                )
+                if callable(stopper):
+                    stopper()
             except Exception as exc:                     # pragma: no cover
                 logger.debug(
-                    "Binance[%s] ws manager close failed: %s", self.alias, exc,
+                    "Binance[%s] ws manager teardown failed: %s",
+                    self.alias, exc,
                 )
         self._bm = None
         self._conn_keys.clear()
