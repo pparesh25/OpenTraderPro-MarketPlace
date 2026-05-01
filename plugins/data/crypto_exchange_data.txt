@@ -354,6 +354,60 @@ class BinanceSession:
                 self.alias, exc,
             )
 
+    # ── Persistent proxy (F-S2-bin-proxy) ────────────────────────────
+    def apply_persistent_proxy(self, proxy_url: str | None) -> None:
+        """Set ``client.session.proxies`` for ALL subsequent calls.
+
+        Pre-fix the plugin used a per-call ``_proxy_scope`` wrapper around
+        order-mutating methods only (``place_order`` / ``cancel_order`` /
+        ``modify_order``); ``authenticate``, ``get_account``,
+        ``get_klines`` etc. ran direct. The architectural assumption was
+        "query methods don't need static IP" — broken for users who
+        enable Binance's "Restrict access to trusted IPs only" on the
+        API key, because Binance enforces the allowlist on EVERY
+        signed REST endpoint, not just order placement. The user's
+        ``authenticate()`` call from the app's local home IP was
+        rejected with ``"Invalid API-key, IP, or permissions for
+        action"`` before they could even reach ``place_order``.
+
+        Setting ``session.proxies`` once at configure time routes every
+        subsequent REST call through the SOCKS5 tunnel. WebSocket
+        ticker streams (``BinanceSocketManager``) connect via a
+        separate library that does not consult ``client.session``, so
+        the public market-data WebSocket continues to take the direct
+        path — correct, since public WS endpoints don't need static
+        IP. The user-data WebSocket also bypasses ``client.session``
+        but it authenticates via the listenKey REST handshake (which
+        DOES go through the proxy now), so the workflow stays valid.
+
+        Idempotent: calling with the same URL is a no-op. Calling
+        with ``None`` clears any previously-set proxy (graceful
+        degrade if the tunnel is torn down between configure calls).
+        """
+        if self._client is None:
+            return
+        session = getattr(self._client, "session", None)
+        if session is None:
+            return
+        if not proxy_url:
+            session.proxies = {}
+            logger.info(
+                "BinanceSession[%s] persistent proxy cleared.", self.alias,
+            )
+            return
+        # F-S2-bin-proxy — accept ``socks5://`` or ``socks5h://``;
+        # normalise to ``socks5h://`` so DNS resolves at the proxy
+        # side. Without ``h``, requests resolves locally and may
+        # connect to a different IP than the proxy's resolver
+        # (rare but possible behind split DNS).
+        if proxy_url.startswith("socks5://"):
+            proxy_url = proxy_url.replace("socks5://", "socks5h://", 1)
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+        logger.info(
+            "BinanceSession[%s] persistent proxy applied: %s",
+            self.alias, proxy_url,
+        )
+
     # ── Internals ────────────────────────────────────────────────────
     def _dispose(self) -> None:
         """Drop the client + caches (called by session_registry on eviction)."""
@@ -449,10 +503,38 @@ class DataPlugin(DataPluginV2):
         ok = self._session.configure(api_key, api_secret, testnet)
         if not ok:
             raise RuntimeError("BinanceSession.configure() failed")
-        # V3 §N2 — Binance market-data REST + WS go direct (the static-IP
-        # tunnel scope is order placement only). Accept ``routing`` for
-        # ABC conformance.
-        del routing
+        # F-S2-bin-proxy — when SOCKS5 routing is configured, apply it
+        # PERSISTENTLY to ``client.session.proxies`` so EVERY signed
+        # REST call (authenticate's get_account, get_klines, ticker,
+        # etc.) traverses the tunnel. Pre-fix only order methods used
+        # ``_proxy_scope`` per-call; authenticate ran direct from the
+        # app's local home IP and Binance's IP-allowlist (when the user
+        # enables "Restrict access to trusted IPs only" on the API key)
+        # rejected with the misleading ``"Invalid API-key, IP, or
+        # permissions for action"`` before order placement was ever
+        # attempted. WebSocket market-data streams continue direct
+        # (separate library, ignores ``client.session``) — correct,
+        # since public WS endpoints don't need static IP.
+        proxy_url = (
+            getattr(getattr(routing, "routed", None), "proxy_url", None)
+            if routing is not None else None
+        )
+        # ``getattr`` shield: if a partial install left a stale
+        # BinanceSession (without this method) in session_registry,
+        # skip silently rather than crash configure(). User will see
+        # the auth-fails-on-allowlist symptom and a missing-method
+        # log line pointing at the partial install.
+        applier = getattr(self._session, "apply_persistent_proxy", None)
+        if callable(applier):
+            applier(proxy_url)
+        elif proxy_url:
+            logger.warning(
+                "BinanceSession[%s] missing apply_persistent_proxy — "
+                "data plugin can't route signed REST through the SOCKS5 "
+                "tunnel. Likely a partial marketplace install: re-run "
+                "'Install marketplace files' from the Accounts panel.",
+                self.alias,
+            )
         self._configured = True
 
     def authenticate(self) -> AuthResult:
