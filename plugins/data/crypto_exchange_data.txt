@@ -25,7 +25,8 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import date, datetime, time as dtime, timezone
 from types import MappingProxyType
 from typing import Any, ClassVar
@@ -230,11 +231,17 @@ class BinanceSession:
             return False, f"Connection failed: {exc}"
 
     def authenticate(self) -> tuple[bool, str]:
-        """Verify API keys by calling ``client.get_account()``."""
+        """Verify API keys by calling ``client.get_account()``.
+
+        F-S2-bin-public-direct — wrapped in :meth:`_signed_call_proxy`
+        so the SIGNED ``get_account`` request traverses the SOCKS5
+        tunnel (when configured). Public REST + WebSocket continue
+        direct elsewhere — see ``apply_persistent_proxy`` docstring.
+        """
         if self._client is None:
             return False, "Not configured"
         try:
-            with self.api_lock:
+            with self._signed_call_proxy(), self.api_lock:
                 self._client.get_account()
             self._authenticated = True
             logger.info("BinanceSession[%s] authenticated", self.alias)
@@ -248,6 +255,32 @@ class BinanceSession:
                 "BinanceSession[%s] auth error: %s", self.alias, exc,
             )
             return False, f"Auth error: {exc}"
+
+    @contextmanager
+    def _signed_call_proxy(self) -> Iterator[None]:
+        """F-S2-bin-public-direct — temporarily route THIS REST call
+        through the stored signed-call proxy URL, then restore.
+
+        Uses python-binance's ``Client.session.proxies`` mutation
+        pattern (same shape as :func:`_proxy_scope` in the exec
+        plugin). No-op when no proxy is configured (signed call
+        runs direct — broker rejects it if IP allowlist requires
+        the tunnel, surfacing the misconfig clearly).
+        """
+        url = getattr(self, "_signed_proxy_url", None)
+        if not url or self._client is None:
+            yield
+            return
+        session = getattr(self._client, "session", None)
+        if session is None:
+            yield
+            return
+        prior = dict(getattr(session, "proxies", {}) or {})
+        try:
+            session.proxies = {"http": url, "https": url}
+            yield
+        finally:
+            session.proxies = prior
 
     # ── Exchange info cache ──────────────────────────────────────────
     def load_symbols(self, segment: str = SPOT, force: bool = False) -> None:
@@ -385,59 +418,68 @@ class BinanceSession:
                 self.alias, exc,
             )
 
-    # ── Persistent proxy (F-S2-bin-proxy) ────────────────────────────
+    # ── Signed-call proxy (F-S2-bin-proxy + F-S2-bin-public-direct) ──
     def apply_persistent_proxy(self, proxy_url: str | None) -> None:
-        """Set ``client.session.proxies`` for ALL subsequent calls.
+        """Store the proxy URL for SIGNED REST calls only.
 
-        Pre-fix the plugin used a per-call ``_proxy_scope`` wrapper around
-        order-mutating methods only (``place_order`` / ``cancel_order`` /
-        ``modify_order``); ``authenticate``, ``get_account``,
-        ``get_klines`` etc. ran direct. The architectural assumption was
-        "query methods don't need static IP" — broken for users who
-        enable Binance's "Restrict access to trusted IPs only" on the
-        API key, because Binance enforces the allowlist on EVERY
-        signed REST endpoint, not just order placement. The user's
-        ``authenticate()`` call from the app's local home IP was
-        rejected with ``"Invalid API-key, IP, or permissions for
-        action"`` before they could even reach ``place_order``.
+        F-S2-bin-public-direct — the prior behaviour (set
+        ``client.session.proxies`` globally, routing EVERY REST call
+        through the tunnel including public ``get_klines`` /
+        ``get_exchange_info``) caused two real-user issues:
 
-        Setting ``session.proxies`` once at configure time routes every
-        subsequent REST call through the SOCKS5 tunnel. WebSocket
-        ticker streams (``BinanceSocketManager``) connect via a
-        separate library that does not consult ``client.session``, so
-        the public market-data WebSocket continues to take the direct
-        path — correct, since public WS endpoints don't need static
-        IP. The user-data WebSocket also bypasses ``client.session``
-        but it authenticates via the listenKey REST handshake (which
-        DOES go through the proxy now), so the workflow stays valid.
+        * Backfill saturated the SSH tunnel — 30 days × 1m × 20
+          symbols ≈ 860 paginated klines requests, each adding
+          tunnel-RTT (~200 ms) on top of Binance-RTT, plus tunnel
+          bandwidth contention with the live ticker WebSocket
+          (which is direct, but the same egress IP). Backfill
+          stretched from ~30 seconds (direct) to several minutes.
+        * MtmUpdater + position polling on the Qt main thread
+          waited on tunnel-bound HTTP calls → UI froze during
+          backfill.
 
-        Idempotent: calling with the same URL is a no-op. Calling
-        with ``None`` clears any previously-set proxy (graceful
-        degrade if the tunnel is torn down between configure calls).
+        Public endpoints (``get_klines``, ``get_exchange_info``,
+        ``ping``, ``server_time``, ticker WebSocket) do NOT need the
+        tunnel — Binance enforces IP allowlisting only on SIGNED
+        endpoints (``get_account``, ``futures_account``,
+        ``futures_position_information``, ``create_order``, etc.).
+
+        Post-fix this method is **store-only**: it caches
+        ``proxy_url`` on the session for callers to retrieve via
+        :meth:`proxy_url`. Each signed-method call wraps its own
+        Binance call in :func:`_proxy_scope` to apply the proxy
+        per-call, then restore. Public methods don't enter the
+        scope and run direct.
+
+        Idempotent: storing the same URL twice is a no-op. ``None``
+        clears the stored URL (post-fix this also makes signed
+        calls go direct — appropriate for a torn-down tunnel where
+        retrying through the tunnel would block; the broker call
+        will then surface the ``-2015 IP not allowed`` error to
+        signal the misconfig clearly).
         """
-        if self._client is None:
-            return
-        session = getattr(self._client, "session", None)
-        if session is None:
-            return
-        if not proxy_url:
-            session.proxies = {}
-            logger.info(
-                "BinanceSession[%s] persistent proxy cleared.", self.alias,
-            )
-            return
-        # F-S2-bin-proxy — accept ``socks5://`` or ``socks5h://``;
-        # normalise to ``socks5h://`` so DNS resolves at the proxy
-        # side. Without ``h``, requests resolves locally and may
-        # connect to a different IP than the proxy's resolver
-        # (rare but possible behind split DNS).
-        if proxy_url.startswith("socks5://"):
+        if proxy_url and proxy_url.startswith("socks5://"):
+            # Normalise to ``socks5h://`` so DNS resolves at the proxy
+            # side (otherwise ``requests`` resolves locally and may
+            # connect to a different IP than the proxy's resolver
+            # behind split DNS).
             proxy_url = proxy_url.replace("socks5://", "socks5h://", 1)
-        session.proxies = {"http": proxy_url, "https": proxy_url}
-        logger.info(
-            "BinanceSession[%s] persistent proxy applied: %s",
-            self.alias, proxy_url,
+        self._signed_proxy_url = proxy_url or None
+        if proxy_url:
+            logger.info(
+                "BinanceSession[%s] signed-call proxy: %s "
+                "(public REST + WebSocket stay direct)",
+                self.alias, proxy_url,
         )
+        else:
+            logger.info(
+                "BinanceSession[%s] signed-call proxy cleared (all "
+                "subsequent signed REST will run direct).", self.alias,
+            )
+
+    @property
+    def proxy_url(self) -> str | None:
+        """Stored signed-call proxy URL (set via apply_persistent_proxy)."""
+        return getattr(self, "_signed_proxy_url", None)
 
     # ── Internals ────────────────────────────────────────────────────
     def _dispose(self) -> None:
@@ -874,6 +916,26 @@ class DataPlugin(DataPluginV2):
         # lacks the entry (defensive — should always be present after
         # a successful subscribe_realtime call).
         exchange = self._symbol_exchange.get(symbol, "BINANCE")
+        # F-S2-bin-tickfields — Binance's individual symbol ticker WS
+        # payload (``<symbol>@ticker``, 24h rolling) carries day OHLC +
+        # previous-day close on every tick. Pre-fix the plugin built
+        # ``Tick`` with only ``symbol/price/volume/bid/ask`` and ignored
+        # the rest, so:
+        #   * Market Watch's High/Low cells stayed on "—" forever
+        #     (panel reads ``tick.day_high`` / ``tick.day_low`` and
+        #     skips the cell when ``None``).
+        #   * Change% computed from ``tick.prev_close`` was always 0
+        #     on first tick → MW fell back to seeding ``prev_close``
+        #     from the FIRST bar close after MW opened, not yesterday's
+        #     close. Result: change% drifted from the broker's
+        #     "since yesterday's close" baseline (mobile app shows
+        #     +2%) to "since session-start baseline" (app showed
+        #     -0.40% with the same ticker).
+        # Binance ticker payload field guide
+        # (https://binance-docs.github.io/apidocs/spot/en/#individual-symbol-ticker-streams):
+        #   o = open price (24h)         h = high price (24h)
+        #   l = low price (24h)          x = previous day's close price
+        #   c = current/last close price (= ``price`` we already use)
         try:
             cb(Tick(
                 symbol=symbol,
@@ -883,6 +945,10 @@ class DataPlugin(DataPluginV2):
                 timestamp=ts,
                 bid=float(msg["b"]) if msg.get("b") else None,
                 ask=float(msg["a"]) if msg.get("a") else None,
+                day_open=_safe_float_or_none(msg.get("o")),
+                day_high=_safe_float_or_none(msg.get("h")),
+                day_low=_safe_float_or_none(msg.get("l")),
+                prev_close=_safe_float_or_none(msg.get("x")),
             ))
         except Exception:                                # pragma: no cover
             logger.exception("binance on_tick raised")
@@ -898,6 +964,27 @@ def _coerce_bool(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "on")
     return bool(value)
+
+
+def _safe_float_or_none(value: object) -> float | None:
+    """F-S2-bin-tickfields — Binance ticker payload fields (e.g.
+    ``msg["o"]``, ``msg["h"]``) are JSON strings. Convert to float; on
+    None / empty / unparseable input return None so the consumer's
+    ``Optional[float]`` typing stays honest. Used only on the live-tick
+    hot path; speed isn't critical (one tick per symbol per second).
+    """
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    # Binance occasionally emits "0.00000000" for fields it has no
+    # value for (very early after listing). Treat as absent rather
+    # than 0, since 0 would mislead the change-% calculation.
+    if out <= 0.0:
+        return None
+    return out
 
 
 def _resolve_segment(exchange: str) -> str:
