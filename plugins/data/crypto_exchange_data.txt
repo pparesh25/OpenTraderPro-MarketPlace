@@ -537,9 +537,14 @@ class DataPlugin(DataPluginV2):
         realtime=True,
         historical=True,
         search=True,
+        # F-S2-bin-real-types — V3 §F-S1-10 requires data + exec sides
+        # to advertise the SAME ``exchange_to_segment`` mapping; updated
+        # in lockstep with ``crypto_exchange_exec.txt``.
         exchange_to_segment=MappingProxyType({
             "BINANCE": SPOT,
             "CRYPTO": SPOT,
+            "BINANCE_USDM": USDM,
+            "BINANCE_COINM": COINM,
         }),
     )
 
