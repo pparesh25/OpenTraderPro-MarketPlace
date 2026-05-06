@@ -1259,17 +1259,108 @@ _METHODS: dict[str, dict[str, str]] = {
 
 
 # ── Order-type maps (per-segment where it differs) ─────────────────────
+# F-S2-bin-real-types — these are the REAL Binance API ``type`` values
+# (https://github.com/sammchardy/python-binance/blob/master/binance/enums.py).
+# Pre-fix the plugin advertised Zerodha-style ``("MARKET","LIMIT","SL","SL-M")``
+# as ``CAPABILITIES.order_types`` and translated them via these maps;
+# users picking SL on a Binance setup got ``STOP_LOSS_LIMIT`` (sometimes
+# right, sometimes silently wrong on futures). Now CAPABILITIES advertises
+# the real Binance names directly and the maps are identity passthroughs
+# that ALSO accept the legacy Zerodha aliases for back-compat with any
+# strategy / schedule row that pre-dates this change.
 _SPOT_ORDER_TYPE: dict[str, str] = {
-    "MARKET": "MARKET",
-    "LIMIT":  "LIMIT",
-    "SL":     "STOP_LOSS_LIMIT",
-    "SL-M":   "STOP_LOSS",
+    # Binance SPOT enums (per ``binance/enums.py``).
+    "MARKET":            "MARKET",
+    "LIMIT":             "LIMIT",
+    "STOP_LOSS":         "STOP_LOSS",          # market trigger → market exit
+    "STOP_LOSS_LIMIT":   "STOP_LOSS_LIMIT",    # market trigger → limit exit
+    "TAKE_PROFIT":       "TAKE_PROFIT",        # market trigger → market exit
+    "TAKE_PROFIT_LIMIT": "TAKE_PROFIT_LIMIT",  # market trigger → limit exit
+    "LIMIT_MAKER":       "LIMIT_MAKER",        # post-only (rejected if taker)
+    # Legacy Zerodha-style aliases for back-compat with persisted
+    # schedule rows + V1-era strategies. Map to the closest Binance
+    # equivalent. Newly authored strategies should pick the real
+    # Binance names (the Quick Order combo and Schedule dialog
+    # advertise them directly post-fix).
+    "SL":                "STOP_LOSS_LIMIT",
+    "SL-M":              "STOP_LOSS",
 }
 _FUT_ORDER_TYPE: dict[str, str] = {
-    "MARKET": "MARKET",
-    "LIMIT":  "LIMIT",
-    "SL":     "STOP",
-    "SL-M":   "STOP_MARKET",
+    # Binance USDM / COINM Futures enums.
+    "MARKET":               "MARKET",
+    "LIMIT":                "LIMIT",
+    "STOP":                 "STOP",                  # stop-LIMIT (needs price + stopPrice)
+    "STOP_MARKET":          "STOP_MARKET",           # stop-MARKET (needs only stopPrice)
+    "TAKE_PROFIT":          "TAKE_PROFIT",           # tp-LIMIT
+    "TAKE_PROFIT_MARKET":   "TAKE_PROFIT_MARKET",    # tp-MARKET
+    "LIMIT_MAKER":          "LIMIT_MAKER",           # post-only on USDM
+    "TRAILING_STOP_MARKET": "TRAILING_STOP_MARKET",  # callbackRate-based trail
+    # Legacy aliases.
+    "SL":                   "STOP",
+    "SL-M":                 "STOP_MARKET",
+}
+
+# Sets used by ``place_order`` to drive parameter assembly. Keeping them
+# explicit (rather than derived from ``"LIMIT" in name``) makes the
+# special cases (``LIMIT_MAKER`` is post-only, no timeInForce;
+# ``TRAILING_STOP_MARKET`` needs callbackRate not stopPrice) auditable
+# at a glance.
+
+# Order types that need a ``price`` field (limit-style execution leg).
+_PRICE_REQUIRED: frozenset[str] = frozenset({
+    "LIMIT", "LIMIT_MAKER",
+    "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT",     # SPOT
+    "STOP", "TAKE_PROFIT",                       # FUTURES
+    # Legacy aliases — same requirement as their canonical mapping.
+    "SL",
+})
+
+# Order types that need a ``stopPrice`` (trigger field).
+_TRIGGER_REQUIRED: frozenset[str] = frozenset({
+    "STOP_LOSS", "STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT",  # SPOT
+    "STOP", "STOP_MARKET", "TAKE_PROFIT_MARKET",                          # FUTURES
+    "SL", "SL-M",  # legacy aliases
+})
+
+# Order types that need a ``callbackRate`` (FUTURES-only).
+_CALLBACK_RATE_REQUIRED: frozenset[str] = frozenset({
+    "TRAILING_STOP_MARKET",
+})
+
+# LIMIT_MAKER is post-only and rejects any timeInForce (Binance auto-uses GTC).
+_NO_TIME_IN_FORCE: frozenset[str] = frozenset({
+    "MARKET", "LIMIT_MAKER",
+    "STOP_LOSS", "TAKE_PROFIT",          # SPOT market-exit variants
+    "STOP_MARKET", "TAKE_PROFIT_MARKET", "TRAILING_STOP_MARKET",  # FUTURES
+    "SL-M",
+})
+
+# Per-segment order_types for CAPABILITIES.order_types_per_segment so the
+# UI naturally filters out futures-only types when the user is on a SPOT
+# segment (and vice versa). Until the main app reads this field
+# (connect-followup-6), the flat ``CAPABILITIES.order_types`` advertises
+# the union and the plugin's ``place_order`` body rejects mismatches.
+_ORDER_TYPES_BY_SEGMENT: dict[str, tuple[str, ...]] = {
+    SPOT: (
+        "MARKET", "LIMIT",
+        "STOP_LOSS", "STOP_LOSS_LIMIT",
+        "TAKE_PROFIT", "TAKE_PROFIT_LIMIT",
+        "LIMIT_MAKER",
+    ),
+    USDM: (
+        "MARKET", "LIMIT",
+        "STOP", "STOP_MARKET",
+        "TAKE_PROFIT", "TAKE_PROFIT_MARKET",
+        "LIMIT_MAKER",
+        "TRAILING_STOP_MARKET",
+    ),
+    COINM: (
+        "MARKET", "LIMIT",
+        "STOP", "STOP_MARKET",
+        "TAKE_PROFIT", "TAKE_PROFIT_MARKET",
+        "LIMIT_MAKER",
+        "TRAILING_STOP_MARKET",
+    ),
 }
 
 _STATUS_MAP: dict[str, str] = {
@@ -1335,8 +1426,51 @@ class ExecPlugin(ExecPluginV2):
     # endpoints and there's no compliance benefit to routing them.
     CAPABILITIES: ClassVar[ExecCapabilities] = ExecCapabilities(
         segments=SUPPORTED_SEGMENTS,
-        product_types=("NRML",),
-        order_types=("MARKET", "LIMIT", "SL", "SL-M"),
+        # F-S2-bin-real-types — Binance has NO per-order "product"
+        # concept (cf. Zerodha's CNC/MIS/NRML which classify intraday
+        # vs delivery vs F&O margin). Spot trades settle T+0 immediately;
+        # futures use account-level position-mode (One-way / Hedge) and
+        # per-symbol margin-mode (ISOLATED / CROSSED) set via separate
+        # API calls (``futures_change_position_mode`` /
+        # ``futures_change_margin_type``), NOT per-order. Empty tuple
+        # is the honest answer; the AccountsPanel / Quick Order / Backtest
+        # Product combos render empty for Binance accounts (followup-4
+        # made the UI honour empty caps without leaking Zerodha codes).
+        product_types=(),
+        # F-S2-bin-real-types — full union of supported Binance order
+        # types across all three segments. Per-segment subset lives in
+        # ``_ORDER_TYPES_BY_SEGMENT`` and (when the main app supports
+        # ``order_types_per_segment``) gets surfaced via that field for
+        # cascading UI filtering. Until then the flat union advertises
+        # everything; the ``place_order`` body rejects segment / type
+        # mismatches at route time.
+        order_types=(
+            "MARKET", "LIMIT",
+            # SPOT-only stop / take-profit naming.
+            "STOP_LOSS", "STOP_LOSS_LIMIT",
+            "TAKE_PROFIT", "TAKE_PROFIT_LIMIT",
+            # FUTURES-only stop / take-profit naming.
+            "STOP", "STOP_MARKET",
+            "TAKE_PROFIT_MARKET",
+            "TRAILING_STOP_MARKET",
+            # SPOT + FUTURES post-only.
+            "LIMIT_MAKER",
+        ),
+        # F-S14-2 — declare which order types need price + trigger so
+        # the Quick Order widget routes the right input rows. Pre-fix
+        # the widget hardcoded a Zerodha-style ``("LIMIT","SL")`` set;
+        # the new declaration is segment-union-correct.
+        order_types_requiring_price=frozenset({
+            "LIMIT", "LIMIT_MAKER",
+            "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT",   # SPOT
+            "STOP", "TAKE_PROFIT",                     # FUTURES
+        }),
+        order_types_requiring_trigger=frozenset({
+            "STOP_LOSS", "STOP_LOSS_LIMIT",
+            "TAKE_PROFIT", "TAKE_PROFIT_LIMIT",        # SPOT
+            "STOP", "STOP_MARKET",
+            "TAKE_PROFIT_MARKET",                      # FUTURES
+        }),
         async_execution_reports=True,
         rate_limits=RateLimits(buckets=(
             RateLimit(max_units=50, window_seconds=10.0, category="orders"),
@@ -1347,6 +1481,14 @@ class ExecPlugin(ExecPluginV2):
         exchange_to_segment=MappingProxyType({
             "BINANCE": SPOT,
             "CRYPTO": SPOT,
+            # F-S2-bin-real-types — explicit segment → segment identity
+            # entries so a user-built watchlist that already qualifies a
+            # symbol with the futures segment (``BTCUSDT@USDM_FUTURES``)
+            # doesn't get re-routed to SPOT by the main-app default.
+            # The exchange-name MUST be unique across the full plugin
+            # set (V3 §F-S1-10 dedup); these strings are unique today.
+            "BINANCE_USDM": USDM,
+            "BINANCE_COINM": COINM,
         }),
     )
 
@@ -1588,7 +1730,21 @@ class ExecPlugin(ExecPluginV2):
 
         side = "BUY" if request.side == "BUY" else "SELL"
         order_type_map = _SPOT_ORDER_TYPE if segment == SPOT else _FUT_ORDER_TYPE
-        order_type = order_type_map.get(request.order_type, "MARKET")
+        canonical_type = request.order_type
+        if canonical_type not in order_type_map:
+            # F-S2-bin-real-types — reject the order BEFORE the API call
+            # rather than silently defaulting to MARKET (the legacy
+            # behaviour, which masked typos and segment / type mismatches
+            # like "TRAILING_STOP_MARKET" submitted on a SPOT segment).
+            allowed = ", ".join(sorted(order_type_map))
+            return OrderResponse(
+                ok=False,
+                error=(
+                    f"order_type {canonical_type!r} not supported on "
+                    f"{segment} (allowed: {allowed})"
+                ),
+            )
+        order_type = order_type_map[canonical_type]
 
         params: dict[str, Any] = {
             "symbol": symbol,
@@ -1596,17 +1752,61 @@ class ExecPlugin(ExecPluginV2):
             "type": order_type,
             "quantity": qty,
         }
-        if request.order_type in ("LIMIT", "SL"):
+        # F-S2-bin-real-types — segment-aware parameter assembly. Pre-fix
+        # the body hardcoded ``order_type in ("LIMIT", "SL")`` for price
+        # and ``("SL", "SL-M")`` for trigger, leaving every other Binance
+        # native type either silently mis-formatted or rejected by the
+        # API. The driving sets are declared at module top so the rules
+        # are auditable in one place.
+
+        if canonical_type in _PRICE_REQUIRED:
             if price is None:
-                return OrderResponse(ok=False, error="price is required for LIMIT/SL")
+                return OrderResponse(
+                    ok=False,
+                    error=f"price is required for order_type={canonical_type}",
+                )
             params["price"] = format(price, "f")
-            params["timeInForce"] = "GTC"
-        if request.order_type in ("SL", "SL-M"):
+
+        if canonical_type in _TRIGGER_REQUIRED:
             if trigger is None:
                 return OrderResponse(
-                    ok=False, error="trigger_price is required for SL/SL-M",
+                    ok=False,
+                    error=(
+                        f"trigger_price is required for order_type={canonical_type}"
+                    ),
                 )
             params["stopPrice"] = format(trigger, "f")
+
+        if canonical_type in _CALLBACK_RATE_REQUIRED:
+            # TRAILING_STOP_MARKET (FUTURES-only) needs ``callbackRate``
+            # — the trail distance as a percent (e.g. 0.5 = 0.5%). The
+            # OrderRequest doesn't (yet) carry this field; surface the
+            # gap loudly instead of routing a malformed request.
+            extra = getattr(request, "extra_params", None) or {}
+            cb = extra.get("callbackRate")
+            if cb is None:
+                return OrderResponse(
+                    ok=False,
+                    error=(
+                        f"callbackRate is required for order_type={canonical_type} "
+                        "— pass via OrderRequest.extra_params['callbackRate']"
+                    ),
+                )
+            params["callbackRate"] = format(float(cb), "f")
+
+        # timeInForce: applies to LIMIT-style orders that hit the book
+        # (and futures STOP / TAKE_PROFIT which are also limit-style).
+        # MARKET, *_MARKET, LIMIT_MAKER (post-only) and TRAILING_STOP_MARKET
+        # MUST NOT carry timeInForce — Binance rejects with -1106.
+        if canonical_type not in _NO_TIME_IN_FORCE:
+            # GTC is the safe default; future enhancement: surface IOC /
+            # FOK / GTX via OrderRequest.extra_params['timeInForce'].
+            tif = (
+                (getattr(request, "extra_params", None) or {})
+                .get("timeInForce", "GTC")
+            )
+            params["timeInForce"] = tif
+
         # ``newClientOrderId`` is Binance's idempotency key — reuse the
         # router's client_order_id so retries collide instead of duplicating.
         params["newClientOrderId"] = request.client_order_id
