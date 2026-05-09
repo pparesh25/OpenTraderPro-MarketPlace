@@ -1,0 +1,94 @@
+# plugin-type: strategy
+# fast_ema_cross_1m5m.txt — Fast EMA Crossover with 5m Trend Filter
+#
+# Multi-timeframe BUY strategy designed for high signal frequency:
+#
+#   * Entry trigger on the 1-minute chart — fires the bar after a fast
+#     EMA crosses above a slow EMA (the classic "golden cross" applied
+#     intraday).
+#   * Trend filter on the 5-minute chart — only fires when the 5m
+#     close is above its trend EMA. Without this filter the 1m
+#     crossover triggers in choppy sideways markets too; with it the
+#     strategy only fires when the 5m chart agrees the symbol is
+#     trending up.
+#
+# Why 1m+5m: the user can backtest + paper-trade the framework end-to-
+# end in minutes instead of waiting for daily bars. Real-time signal
+# generation rate ≈ 1-3 signals per active intraday symbol per session
+# (depending on watchlist size and market regime).
+#
+# Recommended schedule:
+#   Watchlist:     intraday-friendly symbols (≥ 30 1m bars persisted)
+#   Frequency:     "1min" or "on_bar_close" with trigger_timeframe "1m"
+#   Execution TF:  1m (preferred_timeframe pre-fills this)
+#   Product:       MIS (intraday) or SPOT (crypto)
+#   auto_execute:  False initially — review the signals stream first
+
+import talib
+from opentrader.strategy.base import StrategyBase
+
+
+class Strategy(StrategyBase):
+    name = "Fast EMA Cross (1m+5m)"
+    version = "1.0"
+    description = (
+        "Buy when 1m EMA-fast crosses above EMA-slow AND 5m close is "
+        "above trend EMA — fast intraday entry with multi-TF filter."
+    )
+
+    # AddSchedule + Backtest dialogs default to this on strategy pick;
+    # the user can still override per-schedule.
+    preferred_timeframe = "1m"
+
+    # Pre-fetched into ctx cache by StrategyRunner so every per-symbol
+    # ctx.ohlcv(...) call hits cached frames instead of re-querying /
+    # re-resampling.
+    required_timeframes = ("1m", "5m")
+
+    parameters = {
+        "ema_fast_1m":   9,    # 1m fast EMA — entry trigger
+        "ema_slow_1m":   21,   # 1m slow EMA — entry trigger
+        "ema_trend_5m":  20,   # 5m trend filter EMA
+    }
+
+    def run(self, ctx):
+        ema_f = self.parameters["ema_fast_1m"]
+        ema_s = self.parameters["ema_slow_1m"]
+        ema_t = self.parameters["ema_trend_5m"]
+
+        signals = []
+        for symbol in ctx.symbols:
+            # 1m frame — entry trigger.
+            df_1m = ctx.ohlcv(symbol, "1m")
+            if len(df_1m) < ema_s + 5:
+                continue
+            close_1m = df_1m["close"].values.astype(float)
+            fast = talib.EMA(close_1m, ema_f)
+            slow = talib.EMA(close_1m, ema_s)
+
+            # Crossover detection — fast was at-or-below slow on the
+            # previous bar AND is strictly above on the current bar.
+            crossed = (
+                fast[-2] <= slow[-2]
+                and fast[-1] > slow[-1]
+            )
+            if not crossed:
+                continue
+
+            # 5m frame — trend filter.
+            df_5m = ctx.ohlcv(symbol, "5m")
+            if len(df_5m) < ema_t + 5:
+                continue
+            close_5m = df_5m["close"].values.astype(float)
+            trend = talib.EMA(close_5m, ema_t)
+
+            if close_5m[-1] > trend[-1]:
+                signals.append(
+                    ctx.buy(
+                        symbol,
+                        price=float(close_1m[-1]),
+                        source="EMA_X_1m_5m",
+                    )
+                )
+
+        return signals

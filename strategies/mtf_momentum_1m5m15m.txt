@@ -1,0 +1,99 @@
+# plugin-type: strategy
+# mtf_momentum_1m5m15m.txt — Multi-Timeframe Momentum with 3-TF Alignment
+#
+# Multi-timeframe BUY strategy designed to demonstrate a 3-TF alignment
+# pattern. The strategy reads bars at three different cadences and only
+# fires when all three agree the symbol is in a buyable momentum state:
+#
+#   * 15-minute chart — the "big trend" filter. Price must be above its
+#     longer EMA so the strategy isn't fading the prevailing daily-ish
+#     bias on a 15m timeframe.
+#   * 5-minute chart — the "mid trend" filter. Price must be above its
+#     mid EMA so the swing-leg is bullish too.
+#   * 1-minute chart — the "entry trigger". RSI on the 1m chart must be
+#     above the long threshold (default 55) so we enter with momentum
+#     confirmation rather than at exhaustion.
+#
+# The goal is fewer-but-cleaner signals than a single-TF crossover —
+# all three filters must align, so the strategy stays on the sidelines
+# through choppy periods. Use this as the multi-TF reference example
+# when authoring your own MTF strategies.
+#
+# Recommended schedule:
+#   Watchlist:     intraday-friendly symbols (≥ 60 5m bars persisted)
+#   Frequency:     "5min" or "on_bar_close" with trigger_timeframe "5m"
+#   Execution TF:  5m (preferred_timeframe pre-fills this)
+#   Product:       MIS (intraday) or SPOT (crypto)
+#   auto_execute:  False initially — review the signals stream first
+
+import talib
+from opentrader.strategy.base import StrategyBase
+
+
+class Strategy(StrategyBase):
+    name = "MTF Momentum (1m+5m+15m)"
+    version = "1.0"
+    description = (
+        "Buy when 15m and 5m closes are above their trend EMAs AND "
+        "1m RSI is above the long threshold — three-TF momentum alignment."
+    )
+
+    # 5m is the natural cadence — the strategy fires roughly once per
+    # 5m bar close when alignment holds. Backtest + AddSchedule pick
+    # this up as the default.
+    preferred_timeframe = "5m"
+
+    # Pre-fetched into ctx cache so per-symbol ohlcv() calls are cheap.
+    required_timeframes = ("1m", "5m", "15m")
+
+    parameters = {
+        "ema_15m_period":      50,    # 15m big-trend EMA
+        "ema_5m_period":       20,    # 5m mid-trend EMA
+        "rsi_1m_period":       14,    # 1m RSI lookback
+        "rsi_long_threshold":  55,    # 1m RSI long entry threshold
+    }
+
+    def run(self, ctx):
+        ema_15m_n = self.parameters["ema_15m_period"]
+        ema_5m_n  = self.parameters["ema_5m_period"]
+        rsi_n     = self.parameters["rsi_1m_period"]
+        rsi_thr   = self.parameters["rsi_long_threshold"]
+
+        signals = []
+        for symbol in ctx.symbols:
+            # 15m big-trend filter — must be bullish before we even look.
+            df_15m = ctx.ohlcv(symbol, "15m")
+            if len(df_15m) < ema_15m_n + 5:
+                continue
+            close_15m = df_15m["close"].values.astype(float)
+            ema_15m = talib.EMA(close_15m, ema_15m_n)
+            if close_15m[-1] <= ema_15m[-1]:
+                continue
+
+            # 5m mid-trend filter — must also agree.
+            df_5m = ctx.ohlcv(symbol, "5m")
+            if len(df_5m) < ema_5m_n + 5:
+                continue
+            close_5m = df_5m["close"].values.astype(float)
+            ema_5m = talib.EMA(close_5m, ema_5m_n)
+            if close_5m[-1] <= ema_5m[-1]:
+                continue
+
+            # 1m momentum trigger — RSI above the long threshold.
+            df_1m = ctx.ohlcv(symbol, "1m")
+            if len(df_1m) < rsi_n + 5:
+                continue
+            close_1m = df_1m["close"].values.astype(float)
+            rsi_1m = talib.RSI(close_1m, rsi_n)
+            if rsi_1m[-1] <= rsi_thr:
+                continue
+
+            signals.append(
+                ctx.buy(
+                    symbol,
+                    price=float(close_1m[-1]),
+                    source="MTF_Momentum_3TF",
+                )
+            )
+
+        return signals
