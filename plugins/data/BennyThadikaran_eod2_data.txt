@@ -1,0 +1,1062 @@
+# plugin-type: plugin-data
+"""BennyThadikaran_eod2 — NSE India EOD data-only plugin.
+Based on Benny Thadikaran's eod2 downloader with split/bonus adjustments.
+"""
+
+from __future__ import annotations
+
+import logging
+import json
+import time
+import os
+import re
+import sys
+import shutil
+import zipfile
+import threading
+import dateutil.parser
+import itertools
+from collections.abc import Callable
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+from types import MappingProxyType
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, Union
+
+import numpy as np
+import pandas as pd
+import tzlocal
+
+from opentrader.connectors_v2.contract import (
+    AuthResult,
+    Capabilities,
+    CredentialField,
+    DataPluginV2,
+    ExchangeInfo,
+    MarketWindow,
+    OhlcvBar,
+    PluginInfo,
+    SessionRouting,
+    SymbolInfo,
+)
+
+logger = logging.getLogger(__name__)
+
+# NSE package is optional
+try:
+    from nse import NSE
+    NSE_AVAILABLE = True
+except ImportError:
+    NSE_AVAILABLE = False
+    logger.info("nse library not installed - run `pip install -U nse[server]`")
+
+splitRegex = re.compile(r"(\d+\.?\d*)[\/\- a-z\.]+(\d+\.?\d*)")
+bonusRegex = re.compile(r"(\d+) ?: ?(\d+)")
+dateRegex = re.compile(r"\b[A-Za-z]+, [A-Za-z]+ \d{2}, \d{4}\b")
+headerText = b"Date,Open,High,Low,Close,Volume,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
+indexHeaderText = b"Date,Open,High,Low,Close,Volume,P/E,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
+tz_IN = ZoneInfo("Asia/Kolkata")
+tz_local = tzlocal.get_localzone()
+
+
+class DateEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (datetime, date)):
+            return o.isoformat()
+        return super().default(o)
+
+
+class Dates:
+    "A class for date related functions in EOD2"
+
+    def __init__(self, lastUpdate: str, tz_IN: ZoneInfo):
+        today = datetime.now(tz_IN)
+        self.today = datetime.combine(today, datetime.min.time())
+        dt = datetime.fromisoformat(lastUpdate).astimezone(tz_IN)
+        self.dt = self.lastUpdate = dt
+        self.pandasDt = self.dt.strftime("%Y-%m-%d")
+        self.tz_IN = tz_IN
+
+    def nextDate(self) -> bool:
+        """Set the next trading date and return True.
+        If its a future date, return False"""
+        curTime = datetime.now(self.tz_IN)
+        self.dt = self.dt + timedelta(1)
+
+        if self.dt > curTime:
+            logger.info("All Up To Date")
+            return False
+
+        if self.dt.day == curTime.day and curTime.hour < 16:
+            # Display the users local time
+            local_time = curTime.replace(hour=19, minute=0).astimezone(tz_local)
+            t_str = local_time.strftime("%I:%M%p")  # 07:00PM
+            logger.info(
+                f"All Up To Date. Check again after {t_str} for today's EOD data"
+            )
+            return False
+
+        self.pandasDt = self.dt.strftime("%Y-%m-%d")
+        return True
+
+
+def retry(max_retries=10, base_wait=2, max_wait=10):
+    """Decorator that retries a function or method with exponential backoff in case of exceptions."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    retries += 1
+                    if retries >= max_retries:
+                        raise e
+                    wait_time = min(base_wait * (2 ** (retries - 1)), max_wait)
+                    time.sleep(wait_time)
+            return None
+        return wrapper
+    return decorator
+
+
+def _get_split(sym: str, string: str, logger: logging.Logger) -> float | None:
+    match = splitRegex.search(string)
+    if match is None:
+        logger.warning(f"{sym}: Split Not Matched. {string}")
+        return None
+    try:
+        return float(match.group(1)) / float(match.group(2))
+    except Exception as e:
+        logger.warning(f"{sym}: Error parsing split ratio: {e}")
+        return None
+
+
+def _get_bonus(sym: str, string: str, logger: logging.Logger) -> float | None:
+    match = bonusRegex.search(string)
+    if match is None:
+        logger.warning(f"{sym}: Bonus Not Matched. {string}")
+        return None
+    try:
+        return 1 + int(match.group(1)) / int(match.group(2))
+    except Exception as e:
+        logger.warning(f"{sym}: Error parsing bonus ratio: {e}")
+        return None
+
+
+def _make_adjustment(
+    symbol: str,
+    adjustmentFactor: float,
+    data_dir: Path,
+    dates: Dates,
+    logger: logging.Logger,
+    prev_commit: Optional[Dict[str, Any]] = None,
+) -> Optional[Tuple[pd.DataFrame, Path]]:
+    daily_folder = data_dir / "daily"
+    if prev_commit:
+        file: Path = prev_commit["file"]
+        df: pd.DataFrame = prev_commit["df"]
+    else:
+        file = daily_folder / f"{symbol.lower()}.csv"
+
+        if not file.is_file():
+            logger.warning(f"{symbol}: File not found for adjustment - {dates.pandasDt}")
+            return None
+
+        df = pd.read_csv(file, index_col="Date", parse_dates=["Date"])
+
+    # Remove timezone info as DataFrame index is not timezone aware
+    dt = dates.dt.replace(tzinfo=None)
+
+    if dt in df.index:
+        idx = df.index.get_loc(dt)
+        if isinstance(idx, slice):
+            logger.warning(
+                f"Duplicate dates detected on {symbol} making adjustment - {dates.pandasDt}"
+            )
+            raise RuntimeError()
+        last = df.iloc[idx:]
+        df = df.iloc[:idx].copy()
+    else:
+        last = df.loc[dt:]
+        df = df.loc[:dt].copy()
+        if not df.empty:
+            idx = df.index.get_loc(df.index[-1])
+
+    for col in ("Open", "High", "Low", "Close"):
+        # nearest 0.05 = round(nu / 0.05) * 0.05
+        df.loc[:, col] = ((df[col] / adjustmentFactor / 0.05).round() * 0.05).round(2)
+
+    df = pd.concat([df, last])
+
+    return (df, file)
+
+
+def _adjust_nse_stocks(meta: dict, data_dir: Path, dates: Dates, logger: logging.Logger):
+    logger.info("Making adjustments for splits and bonus")
+
+    dtStr = dates.dt.strftime("%d-%b-%Y")
+
+    for actions in ("equityActions", "smeActions", "mfActions"):
+        df_commits: dict[str, dict[str, Any]] = {}
+        post_commits: List[Tuple[str, float]] = []
+        error_context = None
+
+        try:
+            for act in meta.get(actions, []):
+                sym = act["symbol"]
+                purpose = act["subject"].lower()
+                ex = act["exDate"]
+                series = act["series"]
+
+                if series not in ("EQ", "BE", "BZ", "SM", "ST"):
+                    continue
+
+                if series in ("SM", "ST"):
+                    sym += "_sme"
+
+                if (
+                    "split" in purpose
+                    or "splt" in purpose
+                    or "consolidation" in purpose
+                ) and ex == dtStr:
+                    if "consolidation" in purpose:
+                        error_context = f"{sym} - consolidation - {dtStr}"
+                        i = purpose.index("consolidation")
+                    else:
+                        error_context = f"{sym} - Split - {dtStr}"
+                        i = purpose.index("spl")
+
+                    adjustmentFactor = _get_split(sym, purpose[i:], logger)
+
+                    if adjustmentFactor is None:
+                        logger.warning(
+                            f"Possible adjustment failure: SPLIT - {sym} - {purpose} - exDate: {dtStr}"
+                        )
+                        continue
+
+                    commit = _make_adjustment(
+                        sym, adjustmentFactor, data_dir, dates, logger, df_commits.get(sym, None)
+                    )
+
+                    if commit:
+                        df, file = commit
+                        if sym in df_commits:
+                            df_commits[sym]["df"] = df
+                        else:
+                            df_commits[sym] = {"file": file, "df": df}
+
+                        post_commits.append((sym, adjustmentFactor))
+                        logger.info(f"{sym}: {purpose}")
+
+                if "bonus" in purpose and ex == dtStr:
+                    if (
+                        "deb" in purpose
+                        or "pref" in purpose
+                        or "ncrps" in purpose
+                        or "dvr" in purpose
+                    ):
+                        continue
+
+                    error_context = f"{sym} - Bonus - {dtStr}"
+                    adjustmentFactor = _get_bonus(sym, purpose, logger)
+
+                    if adjustmentFactor is None:
+                        logger.warning(
+                            f"Possible adjustment failure: BONUS - {sym} - {purpose} - exDate: {dtStr}"
+                        )
+                        continue
+
+                    commit = _make_adjustment(
+                        sym, adjustmentFactor, data_dir, dates, logger, df_commits.get(sym, None)
+                    )
+
+                    if commit:
+                        df, file = commit
+                        if sym in df_commits:
+                            df_commits[sym]["df"] = df
+                        else:
+                            df_commits[sym] = {"file": file, "df": df}
+
+                        post_commits.append((sym, adjustmentFactor))
+                        logger.warning(f"{sym}: {purpose}")
+
+        except Exception as e:
+            logger.critical(f"Adjustment Error - Context {error_context}")
+            df_commits.clear()
+            raise e
+
+        # commit changes
+        for sym, commit in df_commits.items():
+            file: Path = commit["file"]
+            df: pd.DataFrame = commit["df"]
+
+            dt = dates.dt.replace(tzinfo=None)
+
+            if dt in df.index:
+                idx = df.index.get_loc(dt)
+                if isinstance(idx, int):
+                    close = df.at[df.index[idx], "Close"]
+                    if idx > 0:
+                        prev_close = df.at[df.index[idx - 1], "Close"]
+                        diff = close / prev_close
+                        if diff > 1.5 or diff < 0.67:
+                            context = f"Current Close {close}, Previous Close {prev_close}"
+                            logger.warning(
+                                f"WARN: Possible adjustment failure in {sym}: {context} - {dates.pandasDt}"
+                            )
+            else:
+                logger.warning(
+                    f"Unable to verify adjustment on {sym} - Please confirm manually. - {dates.pandasDt}"
+                )
+
+            df.to_csv(file)
+
+        df_commits.clear()
+        post_commits.clear()
+
+
+def _check_reports_update_status(nse: NSE, dates: Dates) -> Dict[str, bool]:
+    result = {
+        "CM-UDIFF-BHAVCOPY-CSV": False,
+        "CM-BHAVDATA-FULL": False,
+        "INDEX-SNAPSHOT": False,
+    }
+
+    cm_data = nse.fetch_daily_reports_file_metadata(segment="CM")
+    index_data = nse.fetch_daily_reports_file_metadata(segment="INDEX")
+
+    if not (cm_data.get("CurrentDay") or index_data.get("CurrentDay")):
+        return result
+
+    cm_report_date = datetime.strptime(cm_data["currentDate"], "%d-%b-%Y")
+
+    if cm_report_date != dates.today.replace(tzinfo=None):
+        raise RuntimeError("Market is closed today or report date mismatch")
+
+    for dct in itertools.chain(cm_data.get("CurrentDay", []), index_data.get("CurrentDay", [])):
+        key = dct.get("fileKey")
+        if key in result:
+            result[key] = True
+
+    return result
+
+
+def _check_for_holidays(nse: NSE, dates: Dates, meta: dict, logger: logging.Logger) -> bool:
+    curDt = dates.dt.strftime("%d-%b-%Y")
+
+    if dates.dt.replace(tzinfo=None) in tuple(
+        datetime.fromisoformat(x) for x in meta.get("special_sessions", [])
+    ):
+        return False
+
+    if (
+        "holidays" not in meta
+        or meta.get("year") != dates.dt.year
+    ):
+        if dates.dt.year == dates.today.year:
+            meta["holidays"] = _get_holiday_list(nse, logger)
+            meta["year"] = dates.dt.year
+
+    isMuhurat = curDt in meta.get("holidays", {}) and "Laxmi Pujan" in meta["holidays"][curDt]
+
+    if isMuhurat:
+        return False
+
+    if dates.dt.weekday() == 6:  # Sunday
+        return True
+
+    if curDt in meta.get("holidays", {}):
+        logger.info(f"{curDt} Market Holiday: {meta['holidays'][curDt]}")
+        return True
+
+    return False
+
+
+@retry()
+def _get_holiday_list(nse: NSE, logger: logging.Logger):
+    data = nse.holidays(type=nse.HOLIDAY_TRADING)
+    data["CM"].append(_get_muhurat_holiday_info(data))
+    data = {k["tradingDate"]: k["description"] for k in data["CM"] if k}
+    logger.info("NSE Holiday list updated")
+    return data
+
+
+def _get_muhurat_holiday_info(holidays: Dict[str, List[dict]]) -> dict:
+    for lst in holidays.values():
+        if isinstance(lst, list):
+            for dct in lst:
+                if isinstance(dct, dict) and "Laxmi Pujan" in dct.get("description", ""):
+                    return dct
+    return {}
+
+
+@retry()
+def _validate_nse_actions_file(nse: NSE, dates: Dates, meta: dict, logger: logging.Logger, tz_IN: ZoneInfo):
+    for action in ("equity", "sme", "mf"):
+        segment = "equities" if action == "equity" else action
+
+        if f"{action}Actions" not in meta:
+            logger.warning(f"Downloading NSE {action.upper()} actions")
+
+            meta[f"{action}Actions"] = nse.actions(
+                segment=segment,
+                from_date=dates.dt,
+                to_date=dates.dt + timedelta(8),
+            )
+
+            meta[f"{action}ActionsExpiry"] = (dates.dt + timedelta(7)).isoformat()
+        else:
+            expiryDate = datetime.fromisoformat(
+                meta[f"{action}ActionsExpiry"]
+            ).astimezone(tz_IN)
+
+            newExpiry = (expiryDate + timedelta(7)).isoformat()
+
+            # Update every 7 days from last download
+            if dates.dt < expiryDate:
+                continue
+
+            logger.warning(f"Updating NSE {action.upper()} actions")
+
+            meta[f"{action}Actions"] = nse.actions(
+                segment=segment,
+                from_date=expiryDate,
+                to_date=expiryDate + timedelta(8),
+            )
+
+            meta[f"{action}ActionsExpiry"] = newExpiry
+
+
+def _check_special_sessions(nse: NSE, meta: dict, dates: Dates, logger: logging.Logger, tz_IN: ZoneInfo) -> bool:
+    last_update_str = meta.get("special_sessions_last_update", None)
+
+    if last_update_str is None:
+        last_update = (dates.dt - timedelta(5)).replace(tzinfo=None)
+        meta["special_sessions"] = []
+    else:
+        last_update = datetime.fromisoformat(last_update_str)
+
+    circulars = nse.circulars(
+        dept_code="CMTR",
+        from_date=last_update,
+        to_date=dates.today.replace(tzinfo=None),
+    )
+    updated = False
+
+    for circular in circulars.get("data", []):
+        subject = circular.get("sub", "").lower()
+
+        if "trading holiday" in subject and "on account of" in subject:
+            if "holidays" in meta:
+                try:
+                    dt = dateutil.parser.parse(subject, fuzzy=True)
+                    dt_key = dt.strftime("%d-%b-%Y")
+                    if dt_key not in meta["holidays"]:
+                        meta["holidays"][dt_key] = subject
+                        logger.warning(f"Circular Holiday added: {subject}")
+                except Exception:
+                    continue
+            continue
+
+        if "live trading session" not in subject:
+            continue
+
+        try:
+            dt = dateutil.parser.parse(subject, fuzzy=True)
+            iso_date = dt.isoformat()
+            if iso_date not in meta["special_sessions"]:
+                meta["special_sessions"].append(iso_date)
+                logger.warning(f"Circular Special Session: {subject}")
+                updated = True
+        except Exception:
+            continue
+
+    meta["special_sessions_last_update"] = dates.today.date().isoformat()
+    return updated
+
+
+def _update_pending_delivery_data(nse: NSE, date_str: str, data_dir: Path, logger: logging.Logger, tz_IN: ZoneInfo) -> bool:
+    dt = datetime.fromisoformat(date_str)
+    daysSinceFailure = (datetime.now(tz_IN) - dt).days
+
+    dt = dt.replace(tzinfo=None)
+    daily_folder = data_dir / "daily"
+
+    try:
+        FILE = nse.deliveryBhavcopy(dt)
+    except Exception:
+        if daysSinceFailure >= 5:
+            logger.warning(
+                f"Max attempts reached: Aborting future attempts for report dated {dt}"
+            )
+            return True
+        logger.info(f"{dt:%d %b}: Delivery report not yet updated.")
+        return False
+
+    try:
+        df = pd.read_csv(FILE, index_col="SYMBOL")
+
+        # save the csv file
+        DLV_FOLDER = data_dir / "nseDelivery" / str(dt.year)
+        DLV_FOLDER.mkdir(parents=True, exist_ok=True)
+        df.to_csv(DLV_FOLDER / FILE.name)
+
+        df = df[
+            (df[" SERIES"] == " EQ")
+            | (df[" SERIES"] == " BE")
+            | (df[" SERIES"] == " BZ")
+            | (df[" SERIES"] == " SM")
+            | (df[" SERIES"] == " ST")
+        ]
+
+        for sym in df.index:
+            DAILY_FILE = daily_folder / f"{sym.lower()}.csv"
+            if not DAILY_FILE.exists():
+                DAILY_FILE = daily_folder / f"{sym.lower()}_sme.csv"
+                if not DAILY_FILE.exists():
+                    continue
+
+            dailyDf = pd.read_csv(DAILY_FILE, index_col="Date", parse_dates=["Date"])
+
+            if dt not in dailyDf.index:
+                continue
+
+            vol = dailyDf.loc[dt, "Volume"]
+            trdCnt, dq = df.loc[sym, [" NO_OF_TRADES", " DELIV_QTY"]]
+            series = df.loc[sym, " SERIES"].strip()
+
+            dq = vol if series in ("BE", "BZ") else int(dq)
+            avgTrdCnt = "" if trdCnt == "" or pd.isna(trdCnt) else round(vol / trdCnt, 2)
+
+            dailyDf.loc[dt, ["TOTAL_TRADES", "QTY_PER_TRADE", "DLV_QTY"]] = [trdCnt, avgTrdCnt, dq]
+            dailyDf.to_csv(DAILY_FILE)
+
+        FILE.unlink()
+        return True
+    except Exception as e:
+        logger.error(f"Error updating pending delivery data for {date_str}: {e}")
+        if FILE.exists():
+            FILE.unlink()
+        return False
+
+
+def _update_nse_eod(bhavFile: Path, deliveryFile: Optional[Path], data_dir: Path, isin: pd.DataFrame, dates: Dates, logger: logging.Logger):
+    logger.info("Starting Capital Market Data Sync")
+    daily_folder = data_dir / "daily"
+    isin_file = data_dir / "isin.csv"
+
+    isinUpdated = False
+
+    df = pd.read_csv(bhavFile, index_col="ISIN")
+
+    BHAV_FOLDER = data_dir / "nseBhav" / str(dates.dt.year)
+    BHAV_FOLDER.mkdir(parents=True, exist_ok=True)
+    df.to_csv(BHAV_FOLDER / bhavFile.name)
+
+    df = df.loc[
+        (df["SctySrs"] == "EQ")
+        | (df["SctySrs"] == "BE")
+        | (df["SctySrs"] == "BZ")
+        | (df["SctySrs"] == "SM")
+        | (df["SctySrs"] == "ST")
+    ]
+
+    if deliveryFile:
+        dlvDf = pd.read_csv(deliveryFile, index_col="SYMBOL")
+
+        DLV_FOLDER = data_dir / "nseDelivery" / str(dates.dt.year)
+        DLV_FOLDER.mkdir(parents=True, exist_ok=True)
+        dlvDf.to_csv(DLV_FOLDER / deliveryFile.name)
+
+        dlvDf = dlvDf[
+            (dlvDf[" SERIES"] == " EQ")
+            | (dlvDf[" SERIES"] == " BE")
+            | (dlvDf[" SERIES"] == " BZ")
+            | (dlvDf[" SERIES"] == " SM")
+            | (dlvDf[" SERIES"] == " ST")
+        ]
+    else:
+        dlvDf = None
+
+    for t in df.itertuples():
+        if "-RE" in t.TckrSymb:
+            continue
+
+        if dlvDf is not None:
+            if t.TckrSymb in dlvDf.index:
+                trdCnt, dq = dlvDf.loc[t.TckrSymb, [" NO_OF_TRADES", " DELIV_QTY"]]
+                dq = t.TtlTradgVol if t.SctySrs in ("BE", "BZ") else int(dq)
+            else:
+                trdCnt = dq = np.nan
+        else:
+            trdCnt = dq = ""
+
+        prefix = "_sme" if t.SctySrs in ("SM", "ST") else ""
+        SYM_FILE = daily_folder / f"{t.TckrSymb.lower()}{prefix}.csv"
+
+        if pd.isna(t.Index):
+            raise ValueError(
+                f"{t.TckrSymb} missing ISIN number."
+            )
+
+        if t.Index not in isin.index:
+            isinUpdated = True
+            isin.at[t.Index, "SYMBOL"] = t.TckrSymb
+
+        if t.TckrSymb != isin.at[t.Index, "SYMBOL"]:
+            isinUpdated = True
+            old = isin.at[t.Index, "SYMBOL"].lower()
+            new = t.TckrSymb.lower()
+
+            isin.at[t.Index, "SYMBOL"] = t.TckrSymb
+
+            SYM_FILE = daily_folder / f"{new}{prefix}.csv"
+            OLD_FILE = daily_folder / f"{old}{prefix}.csv"
+
+            try:
+                OLD_FILE.rename(SYM_FILE)
+            except FileNotFoundError:
+                logger.warning(f"Renaming daily/{old}.csv to {new}.csv. No such file.")
+
+            logger.warning(f"Name Changed: {old} to {new}")
+
+        _update_nse_symbol(
+            SYM_FILE,
+            t.SctySrs,
+            t.OpnPric,
+            t.HghPric,
+            t.LwPric,
+            t.ClsPric,
+            t.TtlTradgVol,
+            trdCnt,
+            dq,
+            daily_folder,
+            dates,
+        )
+
+    if isinUpdated:
+        isin.to_csv(isin_file)
+
+    logger.info("EOD sync complete")
+
+
+def _update_nse_symbol(symFile: Path, series, open_p, high_p, low_p, close_p, volume, trdCnt, dq, daily_folder, dates):
+    text = b""
+    headerText = b"Date,Open,High,Low,Close,Volume,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
+
+    if not symFile.exists():
+        sme_file = daily_folder / f"{symFile.stem}_sme.csv"
+        if "_sme" not in symFile.name and sme_file.exists():
+            sme_file.rename(symFile)
+        else:
+            text += headerText
+
+    avgTrdCnt = "" if trdCnt == "" or pd.isna(trdCnt) else round(volume / trdCnt, 2)
+
+    text += bytes(
+        f"{dates.pandasDt},{open_p},{high_p},{low_p},{close_p},{volume},{series},{trdCnt},{avgTrdCnt},{dq}\n",
+        encoding="utf-8",
+    )
+
+    with symFile.open("ab") as f:
+        f.write(text)
+
+
+def _update_index_eod(file: Path, data_dir: Path, dates: Dates, logger: logging.Logger):
+    folder = data_dir / "nseIndices" / str(dates.dt.year)
+    folder.mkdir(parents=True, exist_ok=True)
+    daily_folder = data_dir / "daily"
+
+    df = pd.read_csv(file, index_col="Index Name")
+    df.to_csv(folder / file.name)
+
+    cols = [
+        "Open Index Value",
+        "High Index Value",
+        "Low Index Value",
+        "Closing Index Value",
+        "Volume",
+        "P/E",
+    ]
+
+    for col in cols:
+        df.loc[:, col] = pd.to_numeric(df[col], errors="coerce")
+
+    for sym in df.index:
+        open_p, high_p, low_p, close_p, volume, pe = df.loc[sym, cols]
+        _update_indice(sym, open_p, high_p, low_p, close_p, volume, pe, daily_folder, dates)
+
+    logger.info("Index sync complete.")
+
+
+def _update_indice(sym, open_p, high_p, low_p, close_p, volume, pe, daily_folder, dates):
+    if "/" in sym or ":" in sym:
+        sym = sym.replace("/", "-").replace(":", "-")
+
+    file = daily_folder / f"{sym.lower()}.csv"
+    text = b""
+    indexHeaderText = b"Date,Open,High,Low,Close,Volume,P/E,Series,TOTAL_TRADES,QTY_PER_TRADE,DLV_QTY\n"
+
+    if not file.is_file():
+        text += indexHeaderText
+
+    text += bytes(
+        f"{dates.pandasDt},{open_p},{high_p},{low_p},{close_p},{volume},{pe},,,,\n",
+        encoding="utf-8",
+    )
+
+    with file.open("ab") as f:
+        f.write(text)
+
+
+class DataPlugin(DataPluginV2):
+    """BennyThadikaran_eod2 data-only plugin."""
+
+    INFO: ClassVar[PluginInfo] = PluginInfo(
+        name="BennyThadikaran_eod2",
+        display_name="BennyThadikaran_eod2 (NSE EOD)",
+        version="2.0.0",
+        author="Benny Thadikaran / OpenTrader",
+        min_app_api="2.0",
+        description=(
+            "Historical Indian market EOD data for equities, indices and SME stocks. "
+            "Automatically downloads and processes daily Bhavcopies and delivery reports from NSE, "
+            "maintaining a local cache database and applying split and bonus adjustments. "
+            "Requires: pip install -U nse[server] pandas tzlocal"
+        ),
+    )
+
+    CREDENTIAL_SCHEMA: ClassVar[tuple[CredentialField, ...]] = (
+        CredentialField(
+            name="data_dir",
+            label="Data Directory Path",
+            type="text",
+            required=False,
+            help_text=(
+                "Optional path to the eod2_data directory (e.g. /Users/paresh/Desktop/eod2-main/src/eod2_data). "
+                "If left blank, defaults to ~/.opentrader-pro/data/BennyThadikaran_eod2."
+            ),
+        ),
+    )
+
+    CAPABILITIES: ClassVar[Capabilities] = Capabilities(
+        segments=("NSE", "NSE_EQ"),
+        realtime=False,
+        historical=True,
+        search=True,
+        exchange_to_segment=MappingProxyType({
+            "NSE": "NSE_EQ",
+        }),
+    )
+
+    def __init__(self, alias: str) -> None:
+        super().__init__(alias)
+        self.data_dir: Path | None = None
+        self._configured = False
+        self._sync_lock = threading.Lock()
+
+    def configure(
+        self,
+        credentials: dict[str, str],
+        *,
+        routing: SessionRouting | None = None,
+    ) -> None:
+        data_dir_str = credentials.get("data_dir", "").strip()
+        if data_dir_str:
+            self.data_dir = Path(data_dir_str).expanduser().resolve()
+        else:
+            self.data_dir = Path.home() / ".opentrader-pro" / "data" / "BennyThadikaran_eod2"
+
+        self._configured = True
+        logger.info("BennyThadikaran_eod2[%s] configured with data_dir=%s", self.alias, self.data_dir)
+
+    def authenticate(self) -> AuthResult:
+        """Data-only local plugin doesn't need broker authentication."""
+        return AuthResult(ok=True)
+
+    def test_connection(self) -> bool:
+        """Cheap liveness probe."""
+        return True
+
+    def shutdown(self) -> None:
+        """Clean up."""
+        super().shutdown()
+
+    def get_timezone(self, segment: str | None = None) -> ZoneInfo:
+        return ZoneInfo("Asia/Kolkata")
+
+    def get_market_hours(
+        self, segment: str | None = None
+    ) -> tuple[MarketWindow, ...]:
+        ist = ZoneInfo("Asia/Kolkata")
+        equity = MarketWindow(dtime(9, 15), dtime(15, 30), tz=ist)
+        return (equity,)
+
+    def fetch_historical(
+        self,
+        symbol: str,
+        exchange: str,
+        timeframe: str,
+        start: date,
+        end: date,
+    ) -> list[OhlcvBar]:
+        if not self._configured:
+            logger.error("Plugin not configured.")
+            return []
+
+        # 1. Initialize directory if empty
+        self._ensure_data_initialized()
+
+        # 2. Sync database to ensure we have latest Bhavcopies
+        self._sync_database()
+
+        # 3. Read data from cached symbol CSV
+        clean_symbol = symbol.split(".")[0].lower() if "." in symbol else symbol.lower()
+        
+        daily_folder = self.data_dir / "daily"
+        csv_file = daily_folder / f"{clean_symbol}.csv"
+        if not csv_file.is_file():
+            csv_file = daily_folder / f"{clean_symbol}_sme.csv"
+            if not csv_file.is_file():
+                logger.debug("CSV file not found for symbol %s in %s", clean_symbol, daily_folder)
+                return []
+
+        try:
+            df = pd.read_csv(csv_file, parse_dates=["Date"])
+            df.set_index("Date", inplace=True)
+            
+            start_dt = pd.Timestamp(start)
+            end_dt = pd.Timestamp(end)
+            
+            df_filtered = df.loc[start_dt:end_dt]
+            
+            bars: list[OhlcvBar] = []
+            for dt, row in df_filtered.iterrows():
+                ts = dt.tz_localize("Asia/Kolkata")
+                bars.append(OhlcvBar(
+                    timestamp=ts,
+                    open=float(row["Open"]),
+                    high=float(row["High"]),
+                    low=float(row["Low"]),
+                    close=float(row["Close"]),
+                    volume=int(row["Volume"]) if row["Volume"] == row["Volume"] else 0,
+                ))
+            return bars
+        except Exception as e:
+            logger.error("Failed to read historical data for %s: %s", symbol, e)
+            return []
+
+    def search_symbols(
+        self,
+        query: str,
+        exchange: str | None = None,
+        segment: str | None = None,
+    ) -> list[SymbolInfo]:
+        if not self._configured:
+            return []
+
+        self._ensure_data_initialized()
+
+        isin_file = self.data_dir / "isin.csv"
+        if not isin_file.is_file():
+            return []
+
+        try:
+            df = pd.read_csv(isin_file)
+            df = df.dropna(subset=["SYMBOL"])
+            
+            query_upper = query.upper()
+            df_filtered = df[df["SYMBOL"].str.upper().str.contains(query_upper, regex=False)]
+            df_filtered = df_filtered.head(100)
+            
+            results: list[SymbolInfo] = []
+            for _, row in df_filtered.iterrows():
+                symbol = str(row["SYMBOL"])
+                series = str(row.get("SERIES", "EQ"))
+                isin_val = str(row.get("ISIN", ""))
+                segment_name = "NSE_EQ" if series in ("EQ", "BE", "BZ", "SM", "ST") else "NSE"
+                
+                results.append(SymbolInfo(
+                    symbol=symbol,
+                    exchange="NSE",
+                    segment=segment_name,
+                    tick_size=0.05,
+                    lot_size=1,
+                    instrument_token=isin_val,
+                    display_name=f"{symbol} ({isin_val}) - {series}",
+                ))
+            return results
+        except Exception as e:
+            logger.error("Failed to search symbols: %s", e)
+            return []
+
+    def _ensure_data_initialized(self) -> None:
+        if self.data_dir.exists() and (self.data_dir / "meta.json").exists() and (self.data_dir / "daily").exists():
+            return
+
+        logger.info("Initializing BennyThadikaran_eod2 data directory at %s...", self.data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        daily_dir = self.data_dir / "daily"
+        daily_dir.mkdir(parents=True, exist_ok=True)
+
+        zip_url = "https://github.com/BennyThadikaran/eod2_data/archive/main.zip"
+        zip_path = self.data_dir / "eod2_data.zip"
+
+        try:
+            import httpx
+            import zipfile
+            import shutil
+
+            logger.info("Downloading initial historical database from %s...", zip_url)
+            with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+                with client.stream("GET", zip_url) as r:
+                    r.raise_for_status()
+                    with zip_path.open("wb") as f:
+                        for chunk in r.iter_bytes(chunk_size=16384):
+                            f.write(chunk)
+
+            logger.info("Extracting database zip file...")
+            with zipfile.ZipFile(zip_path) as z:
+                for member in z.namelist():
+                    parts = member.split("/", 1)
+                    if len(parts) < 2 or not parts[1]:
+                        continue
+                    rel_path = parts[1]
+                    target_path = self.data_dir / rel_path
+                    if member.endswith("/"):
+                        target_path.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        with z.open(member) as source, target_path.open("wb") as target:
+                            shutil.copyfileobj(source, target)
+
+            logger.info("Database initialization complete.")
+        except Exception as exc:
+            logger.error("Failed to initialize BennyThadikaran_eod2 data directory: %s", exc)
+            if zip_path.exists():
+                zip_path.unlink()
+            raise RuntimeError(f"Failed to initialize data directory: {exc}") from exc
+        finally:
+            if zip_path.exists():
+                zip_path.unlink()
+
+    def _sync_database(self) -> None:
+        if not NSE_AVAILABLE:
+            logger.warning("nse package is not installed; database cannot be synced.")
+            return
+
+        meta_file = self.data_dir / "meta.json"
+        if not meta_file.exists():
+            return
+
+        with self._sync_lock:
+            try:
+                meta = json.loads(meta_file.read_bytes())
+                last_update_str = meta.get("lastUpdate")
+                if not last_update_str:
+                    logger.warning("meta.json does not have 'lastUpdate'")
+                    return
+
+                dates = Dates(last_update_str, tz_IN)
+                temp_dir = self.data_dir / "temp"
+                temp_dir.mkdir(exist_ok=True)
+
+                nse = NSE(temp_dir, server=True)
+
+                meta_updated = False
+                if _check_special_sessions(nse, meta, dates, logger, tz_IN):
+                    meta_updated = True
+
+                if "DLV_PENDING_DATES" not in meta:
+                    meta["DLV_PENDING_DATES"] = []
+
+                if meta["DLV_PENDING_DATES"]:
+                    pending_list = meta["DLV_PENDING_DATES"].copy()
+                    logger.info("Updating pending delivery reports.")
+                    for date_str in pending_list:
+                        if _update_pending_delivery_data(nse, date_str, self.data_dir, logger, tz_IN):
+                            meta["DLV_PENDING_DATES"].remove(date_str)
+                            meta_updated = True
+
+                sync_occurred = False
+                while dates.nextDate():
+                    sync_occurred = True
+                    if _check_for_holidays(nse, dates, meta, logger):
+                        meta["lastUpdate"] = dates.lastUpdate = dates.dt
+                        meta_updated = True
+                        continue
+
+                    _validate_nse_actions_file(nse, dates, meta, logger, tz_IN)
+                    meta_updated = True
+
+                    logger.info("Downloading NSE reports for %s", dates.pandasDt)
+
+                    report_status = None
+                    if dates.dt.date() == dates.today.date():
+                        try:
+                            report_status = _check_reports_update_status(nse, dates)
+                            required_reports = {
+                                "CM-UDIFF-BHAVCOPY-CSV": "Equity Bhavcopy not yet updated.",
+                                "INDEX-SNAPSHOT": "Indices report not yet updated.",
+                                "CM-BHAVDATA-FULL": "Delivery Report Unavailable. Will retry in subsequent sync",
+                            }
+                            for key, msg in required_reports.items():
+                                if not report_status.get(key):
+                                    logger.warning(msg)
+                                    if key != "CM-BHAVDATA-FULL":
+                                        raise RuntimeError("Reports not yet updated on NSE")
+                        except Exception as e:
+                            logger.info("Reports check failed or not ready: %s. Stopping sync.", e)
+                            break
+
+                    try:
+                        bhav_file = nse.equityBhavcopy(dates.dt)
+                        index_file = nse.indicesBhavcopy(dates.dt)
+                    except Exception as e:
+                        logger.warning("Failed to download bhavcopy/indices for %s: %s. Stopping sync.", dates.pandasDt, e)
+                        break
+
+                    delivery_file = None
+                    if report_status is None or report_status.get("CM-BHAVDATA-FULL"):
+                        try:
+                            delivery_file = nse.deliveryBhavcopy(dates.dt)
+                        except Exception as e:
+                            meta["DLV_PENDING_DATES"].append(dates.dt.isoformat())
+                            logger.warning("Delivery report unavailable for %s. Will retry.", dates.pandasDt)
+                    else:
+                        meta["DLV_PENDING_DATES"].append(dates.dt.isoformat())
+
+                    try:
+                        isin_file = self.data_dir / "isin.csv"
+                        isin = pd.read_csv(isin_file, index_col="ISIN")
+
+                        _update_nse_eod(bhav_file, delivery_file, self.data_dir, isin, dates, logger)
+                        _update_index_eod(index_file, self.data_dir, dates, logger)
+
+                        _adjust_nse_stocks(meta, self.data_dir, dates, logger)
+
+                        for f in (bhav_file, delivery_file, index_file):
+                            if f and f.exists():
+                                f.unlink()
+
+                    except Exception as e:
+                        logger.exception("Error during sync for %s.", dates.pandasDt)
+                        for f in (bhav_file, delivery_file, index_file):
+                            if f and f.exists():
+                                f.unlink()
+                        break
+
+                    meta["lastUpdate"] = dates.lastUpdate = dates.dt
+                    meta_updated = True
+                    logger.info("%s: Sync complete", dates.pandasDt)
+
+                if temp_dir.exists():
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+
+                if meta_updated:
+                    meta_file.write_text(json.dumps(meta, indent=3, cls=DateEncoder))
+
+                nse.exit()
+
+            except Exception as e:
+                logger.error("Error in sync_database: %s", e)
