@@ -892,10 +892,13 @@ class DataPlugin(DataPluginV2):
         records: list[SymbolRecord] = []
         for row in rows:
             itype_str = str(row.get("instrument_type", "EQ")).upper()
-            row_segment = _segment_for(exch, itype_str)
-            # An equity segment request (NSE_EQ/BSE_EQ) must skip the F&O rows
-            # that share the same exchange; _segment_for already separates them.
-            if not segment_matches(row_segment, want):
+            # Finer dump segment splits each derivative exchange into FUT/OPT
+            # (MCX-FUT/MCX-OPT, NFO-FUT/NFO-OPT, CDS-FUT/CDS-OPT) so the
+            # watchlist builder can navigate a commodity-futures board vs an
+            # option chain separately — collapsing all of MCX into one segment
+            # mixed crude futures with its CE/PE options.
+            row_segment = _dump_segment(exch, itype_str)
+            if not _belongs_to(row_segment, want):
                 continue
             itype = _KITE_ITYPE.get(itype_str, InstrumentType.EQUITY)
             is_derivative = itype.is_derivative
@@ -1151,8 +1154,42 @@ def _kite_expiry(v: Any) -> date | None:
     return None
 
 
+# Derivative exchanges whose dump segment splits into FUT vs OPT (Kite's own
+# instruments `segment` column does the same — NFO-FUT/NFO-OPT, MCX-FUT/MCX-OPT,
+# CDS-FUT/CDS-OPT, BFO-FUT/BFO-OPT, BCD-FUT/BCD-OPT).
+_DERIVATIVE_EXCHANGES = ("NFO", "BFO", "MCX", "CDS", "BCD")
+
+
+def _dump_segment(exchange: str, instrument_type: str) -> str:
+    """Finer segment for the instrument-master dump (fetch_instruments only).
+
+    Splits derivative exchanges into ``{EXCHANGE}-FUT`` / ``{EXCHANGE}-OPT`` so
+    the watchlist builder navigates futures vs an option chain separately;
+    cash keeps the app's ``NSE_EQ`` / ``BSE_EQ``; index rows fall through to the
+    bare exchange. (``_segment_for`` stays the coarse form for live search.)
+    """
+    it = (instrument_type or "").upper()
+    if exchange in ("NSE", "BSE") and it in ("EQ", "BE"):
+        return f"{exchange}_EQ"
+    if exchange in _DERIVATIVE_EXCHANGES:
+        return f"{exchange}-OPT" if it in ("CE", "PE") else f"{exchange}-FUT"
+    return exchange
+
+
+def _belongs_to(row_segment: str, want: str) -> bool:
+    """Whether a row's dump segment belongs to the requested fetch segment.
+
+    A bare-exchange request (``MCX``/``NFO``/``CDS``) accepts its ``-FUT`` /
+    ``-OPT`` children; otherwise an exact match. So ``fetch_instruments('MCX')``
+    pulls both ``MCX-FUT`` and ``MCX-OPT``, while ``fetch_instruments('NSE_EQ')``
+    pulls only equities (indices stamped bare ``NSE`` are left for the
+    ``NSE`` fetch).
+    """
+    return row_segment == want or row_segment.startswith(want + "-")
+
+
 def _segment_for(exchange: str, instrument_type: str) -> str:
-    """Map (exchange, instrument-type) → v2 segment string."""
+    """Map (exchange, instrument-type) → coarse v2 segment string (live search)."""
     if exchange in ("NSE", "BSE") and instrument_type in ("EQ", "BE"):
         return f"{exchange}_EQ"
     if exchange == "NFO":
