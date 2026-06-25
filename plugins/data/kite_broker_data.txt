@@ -42,9 +42,11 @@ from opentrader.connectors_v2.contract import (
     PluginInfo,
     SessionRouting,
     SymbolInfo,
+    SymbolRecord,
     Tick,
     segment_matches,
 )
+from opentrader.domain import InstrumentType
 
 
 logger = logging.getLogger(__name__)
@@ -600,6 +602,10 @@ class DataPlugin(DataPluginV2):
         realtime=True,
         historical=True,
         search=True,
+        # Kite caches the full per-exchange instrument list at login, so the
+        # app's instrument-sync service can dump a whole segment into
+        # symbol_master in one call (powers the watchlist builder + screener).
+        supports_instrument_dump=True,
         exchange_to_segment=MappingProxyType({
             "NSE": "NSE_EQ",
             "BSE": "BSE_EQ",
@@ -855,6 +861,63 @@ class DataPlugin(DataPluginV2):
                     return hits
         return hits
 
+    # ── Instrument-master dump (V3.2 — bulk catalogue for symbol_master) ─
+    _SEGMENT_EXCHANGE: ClassVar[dict[str, str]] = {
+        "NSE_EQ": "NSE", "NSE": "NSE",
+        "BSE_EQ": "BSE", "BSE": "BSE",
+        "NFO": "NFO", "MCX": "MCX", "CDS": "CDS",
+    }
+
+    def fetch_instruments(self, segment: str) -> list[SymbolRecord]:
+        """Bulk instrument dump for one ``segment`` → ``symbol_master``.
+
+        Reads the per-exchange instrument list Kite already caches at login
+        (``KiteSession._load_instruments``) — no per-symbol network call — and
+        maps each matching row to a :class:`SymbolRecord`. Derivatives
+        (NFO / MCX / CDS futures + options) carry expiry / strike /
+        option_type / underlying so the app can group a futures board or an
+        option chain; cash rows leave those ``None``.
+        """
+        if not self._session.is_authenticated:
+            raise RuntimeError("Not authenticated.")
+        want = (segment or "").upper()
+        exch = self._SEGMENT_EXCHANGE.get(want)
+        if exch is None:
+            raise ValueError(f"kite_broker: unsupported segment {segment!r}")
+        rows = self._session.get_instruments(exch)
+        if not rows:
+            raise RuntimeError(
+                "Instrument list not yet loaded — try again in a moment."
+            )
+        records: list[SymbolRecord] = []
+        for row in rows:
+            itype_str = str(row.get("instrument_type", "EQ")).upper()
+            row_segment = _segment_for(exch, itype_str)
+            # An equity segment request (NSE_EQ/BSE_EQ) must skip the F&O rows
+            # that share the same exchange; _segment_for already separates them.
+            if not segment_matches(row_segment, want):
+                continue
+            itype = _KITE_ITYPE.get(itype_str, InstrumentType.EQUITY)
+            is_derivative = itype.is_derivative
+            is_option = itype is InstrumentType.OPTION
+            records.append(SymbolRecord(
+                symbol=str(row.get("tradingsymbol", "")),
+                exchange=exch,
+                segment=row_segment,
+                instrument_type=itype,
+                display_name=str(row.get("name", "")),
+                tick_size=_kite_pos(row.get("tick_size")),
+                lot_size=_kite_int(row.get("lot_size")),
+                expiry=_kite_expiry(row.get("expiry")) if is_derivative else None,
+                strike=_kite_pos(row.get("strike")) if is_option else None,
+                option_type=itype_str if is_option else None,
+                underlying_symbol=(
+                    str(row.get("name")) or None if is_derivative else None
+                ),
+                underlying_exchange=exch if is_derivative else None,
+            ))
+        return records
+
     # ── Realtime ─────────────────────────────────────────────────────
     def subscribe_realtime(
         self,
@@ -1044,6 +1107,48 @@ def _as_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+# Kite ``instrument_type`` code → domain InstrumentType (for symbol_master).
+_KITE_ITYPE: dict[str, InstrumentType] = {
+    "EQ": InstrumentType.EQUITY,
+    "BE": InstrumentType.EQUITY,
+    "FUT": InstrumentType.FUTURE,
+    "CE": InstrumentType.OPTION,
+    "PE": InstrumentType.OPTION,
+}
+
+
+def _kite_pos(v: Any) -> float | None:
+    """Positive float, else None (Kite uses 0 for 'not applicable')."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _kite_int(v: Any) -> int | None:
+    try:
+        i = int(v)
+    except (TypeError, ValueError):
+        return None
+    return i if i > 0 else None
+
+
+def _kite_expiry(v: Any) -> date | None:
+    """Coerce Kite's ``expiry`` (a ``date``, ``datetime`` or 'YYYY-MM-DD' /
+    '' for cash) to a ``date`` or ``None``."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str) and v:
+        try:
+            return datetime.strptime(v[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
 
 
 def _segment_for(exchange: str, instrument_type: str) -> str:

@@ -44,8 +44,10 @@ from opentrader.connectors_v2.contract import (
     PluginInfo,
     SessionRouting,
     SymbolInfo,
+    SymbolRecord,
     Tick,
 )
+from opentrader.domain import InstrumentType
 
 
 logger = logging.getLogger(__name__)
@@ -537,6 +539,10 @@ class DataPlugin(DataPluginV2):
         realtime=True,
         historical=True,
         search=True,
+        # Binance exchangeInfo (public) lists every symbol of a segment, so the
+        # app's instrument-sync service can dump a whole segment into
+        # symbol_master in one call (powers the watchlist builder + screener).
+        supports_instrument_dump=True,
         # F-S2-bin-real-types — V3 §F-S1-10 requires data + exec sides
         # to advertise the SAME ``exchange_to_segment`` mapping; updated
         # in lockstep with ``crypto_exchange_exec.txt``.
@@ -764,6 +770,56 @@ class DataPlugin(DataPluginV2):
                 if len(hits) >= 20:
                     return hits
         return hits
+
+    # ── Instrument-master dump (V3.2 — bulk catalogue for symbol_master) ─
+    def fetch_instruments(self, segment: str) -> list[SymbolRecord]:
+        """Bulk instrument dump for one ``segment`` → ``symbol_master``.
+
+        Reads Binance's public exchangeInfo (already cached per segment by
+        ``BinanceSession.load_symbols``) and maps every TRADING symbol to a
+        :class:`SymbolRecord`. USDM / COINM rows carry the contract type
+        (perpetual → ``CRYPTO_PERP`` vs dated future → ``CRYPTO_FUTURE`` with
+        its delivery expiry) + the base-asset underlying so the app can group
+        a futures board; SPOT rows are plain ``CRYPTO_SPOT``.
+        """
+        if not self._session.is_authenticated:
+            raise RuntimeError("Not authenticated.")
+        seg = _resolve_segment(segment)
+        if seg not in SUPPORTED_SEGMENTS:
+            raise ValueError(f"crypto_exchange: unsupported segment {segment!r}")
+        self._session.load_symbols(seg)
+        records: list[SymbolRecord] = []
+        for sym in self._session.active_symbols(seg, quote_asset=""):
+            info = self._session.symbol_info(sym, seg) or {}
+            base = str(info.get("baseAsset", ""))
+            quote = str(info.get("quoteAsset", ""))
+            step, min_qty = _lot_filter_of(info)
+            if seg == SPOT:
+                itype = InstrumentType.CRYPTO_SPOT
+                expiry: date | None = None
+                underlying: str | None = None
+            else:
+                perp = str(info.get("contractType", "")).upper() == "PERPETUAL"
+                itype = (
+                    InstrumentType.CRYPTO_PERP if perp
+                    else InstrumentType.CRYPTO_FUTURE
+                )
+                expiry = None if perp else _coerce_delivery(info.get("deliveryDate"))
+                underlying = base or None
+            records.append(SymbolRecord(
+                symbol=sym,
+                exchange=seg,
+                segment=seg,
+                instrument_type=itype,
+                display_name=f"{base}/{quote}" if (base or quote) else sym,
+                tick_size=_tick_size_of(info),
+                step_size=step,
+                min_quantity=min_qty,
+                quote_asset=quote or None,
+                expiry=expiry,
+                underlying_symbol=underlying,
+            ))
+        return records
 
     def get_supported_exchanges(self) -> list[ExchangeInfo]:
         return [
@@ -1045,3 +1101,30 @@ def _tick_size_of(info: dict) -> float:
             except (TypeError, ValueError):
                 break
     return 0.01
+
+
+def _lot_filter_of(info: dict) -> tuple[float | None, float | None]:
+    """Extract (step_size, min_quantity) from the LOT_SIZE filter, or
+    (None, None) when absent — crypto trades fractional sizes."""
+    for f in info.get("filters", []):
+        if f.get("filterType") in ("LOT_SIZE", "MARKET_LOT_SIZE"):
+            try:
+                step = float(f.get("stepSize", 0)) or None
+                min_qty = float(f.get("minQty", 0)) or None
+                return step, min_qty
+            except (TypeError, ValueError):
+                break
+    return None, None
+
+
+def _coerce_delivery(ms: Any) -> date | None:
+    """Binance ``deliveryDate`` (ms epoch) → expiry ``date``. Perpetual
+    contracts carry a year-2100 sentinel → ``None``."""
+    try:
+        ts = int(ms)
+    except (TypeError, ValueError):
+        return None
+    # > 2100-01-01 in ms → the perpetual sentinel (4133404800000-ish).
+    if ts <= 0 or ts > 4102444800000:
+        return None
+    return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).date()
