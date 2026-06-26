@@ -972,6 +972,8 @@ class DataPlugin(DataPluginV2):
             itype = _KITE_ITYPE.get(itype_str, InstrumentType.EQUITY)
             is_derivative = itype.is_derivative
             is_option = itype is InstrumentType.OPTION
+            name_str = str(row.get("name", "")).upper()
+            sector = _MCX_SECTORS.get(name_str) if exch == "MCX" else None
             records.append(SymbolRecord(
                 symbol=str(row.get("tradingsymbol", "")),
                 exchange=exch,
@@ -987,6 +989,7 @@ class DataPlugin(DataPluginV2):
                     str(row.get("name")) or None if is_derivative else None
                 ),
                 underlying_exchange=exch if is_derivative else None,
+                sector=sector,
             ))
         return records
 
@@ -1189,6 +1192,43 @@ _KITE_ITYPE: dict[str, InstrumentType] = {
     "CE": InstrumentType.OPTION,
     "PE": InstrumentType.OPTION,
 }
+
+
+_MCX_SECTORS: dict[str, str] = {
+    # Bullion
+    "GOLD": "Bullion",
+    "GOLDM": "Bullion",
+    "GOLDPETAL": "Bullion",
+    "GOLDGUINEA": "Bullion",
+    "SILVER": "Bullion",
+    "SILVERM": "Bullion",
+    "SILVERMIC": "Bullion",
+    # Energy
+    "CRUDEOIL": "Energy",
+    "CRUDEOILM": "Energy",
+    "NATURALGAS": "Energy",
+    "NATG1DMINI": "Energy",
+    # Base Metals
+    "COPPER": "Base Metals",
+    "COPPERM": "Base Metals",
+    "ZINC": "Base Metals",
+    "ZINCMUNI": "Base Metals",
+    "ZINCM": "Base Metals",
+    "LEAD": "Base Metals",
+    "LEADM": "Base Metals",
+    "ALUMINIUM": "Base Metals",
+    "ALUMINIUMM": "Base Metals",
+    "NICKEL": "Base Metals",
+    "NICKELM": "Base Metals",
+    # Agri Commodities
+    "COTTON": "Agri-Commodity",
+    "COTTONREF": "Agri-Commodity",
+    "MENTHAOIL": "Agri-Commodity",
+    "KAPAS": "Agri-Commodity",
+    "MCXMETLDEX": "Index",
+    "MCXBULLDEX": "Index",
+}
+
 
 
 def _kite_pos(v: Any) -> float | None:
