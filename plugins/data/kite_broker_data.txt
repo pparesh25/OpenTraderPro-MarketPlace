@@ -48,8 +48,90 @@ from opentrader.connectors_v2.contract import (
 )
 from opentrader.domain import InstrumentType
 
+# Optional watchlist-builder presentation overlay (app rearch Increment 3).
+# Guarded so this plugin still imports on an OLDER app that predates
+# SegmentMetadata / Capabilities.segment_metadata.
+try:
+    from opentrader.domain import SegmentMetadata as _SegmentMetadata
+except ImportError:                       # pragma: no cover - older app
+    _SegmentMetadata = None
+
 
 logger = logging.getLogger(__name__)
+
+
+def _kite_segment_metadata() -> dict:
+    """Pretty labels + ordering for the segment codes this plugin dumps into
+    symbol_master (see ``_dump_segment``). Presentation-only — the builder still
+    derives everything else (which segments exist, derivative-ness, facets) from
+    the synced rows. Returns ``{}`` on an older app without SegmentMetadata."""
+    if _SegmentMetadata is None:
+        return {}
+    sm = _SegmentMetadata
+    return {
+        # Cash + index (a bare exchange code = index rows).
+        "NSE": sm(display_name="NSE Index", group="NSE", order=0),
+        "NSE_EQ": sm(display_name="NSE Equity (Cash)", group="NSE", order=1),
+        "BSE": sm(display_name="BSE Index", group="BSE", order=0),
+        "BSE_EQ": sm(display_name="BSE Equity (Cash)", group="BSE", order=1),
+        # NSE / BSE F&O (FUT vs OPT split).
+        "NFO-FUT": sm(display_name="NSE Futures", group="NSE", order=2),
+        "NFO-OPT": sm(
+            display_name="NSE Options", group="NSE", order=3,
+            has_option_chain=True,
+        ),
+        "BFO-FUT": sm(display_name="BSE Futures", group="BSE", order=2),
+        "BFO-OPT": sm(
+            display_name="BSE Options", group="BSE", order=3,
+            has_option_chain=True,
+        ),
+        # MCX commodities.
+        "MCX-FUT": sm(display_name="Commodity Futures", group="MCX", order=2),
+        "MCX-OPT": sm(
+            display_name="Commodity Options", group="MCX", order=3,
+            has_option_chain=True,
+        ),
+        # Currency derivatives.
+        "CDS-FUT": sm(display_name="Currency Futures", group="CDS", order=2),
+        "CDS-OPT": sm(
+            display_name="Currency Options", group="CDS", order=3,
+            has_option_chain=True,
+        ),
+        "BCD-FUT": sm(
+            display_name="BSE Currency Futures", group="BCD", order=2,
+        ),
+        "BCD-OPT": sm(
+            display_name="BSE Currency Options", group="BCD", order=3,
+            has_option_chain=True,
+        ),
+    }
+
+
+def _build_kite_capabilities() -> Capabilities:
+    """Construct CAPABILITIES, adding the segment_metadata overlay only when the
+    running app supports it — additive and backward-compatible (an older app
+    whose Capabilities lacks the field falls back to the base profile)."""
+    base = dict(
+        segments=("NSE", "NSE_EQ", "BSE", "BSE_EQ", "NFO", "MCX", "CDS"),
+        realtime=True,
+        historical=True,
+        search=True,
+        # Kite caches the full per-exchange instrument list at login, so the
+        # app's instrument-sync service can dump a whole segment into
+        # symbol_master in one call (powers the watchlist builder + screener).
+        supports_instrument_dump=True,
+        exchange_to_segment=MappingProxyType({
+            "NSE": "NSE_EQ",
+            "BSE": "BSE_EQ",
+        }),
+    )
+    meta = _kite_segment_metadata()
+    if meta:
+        try:
+            return Capabilities(**base, segment_metadata=meta)
+        except TypeError:                 # pragma: no cover - older app
+            pass
+    return Capabilities(**base)
 
 # Kite Connect access tokens expire at 06:00 IST every trading day.
 # https://kite.trade/docs/connect/v3/user/#user
@@ -597,20 +679,7 @@ class DataPlugin(DataPluginV2):
             ),
         ),
     )
-    CAPABILITIES: ClassVar[Capabilities] = Capabilities(
-        segments=("NSE", "NSE_EQ", "BSE", "BSE_EQ", "NFO", "MCX", "CDS"),
-        realtime=True,
-        historical=True,
-        search=True,
-        # Kite caches the full per-exchange instrument list at login, so the
-        # app's instrument-sync service can dump a whole segment into
-        # symbol_master in one call (powers the watchlist builder + screener).
-        supports_instrument_dump=True,
-        exchange_to_segment=MappingProxyType({
-            "NSE": "NSE_EQ",
-            "BSE": "BSE_EQ",
-        }),
-    )
+    CAPABILITIES: ClassVar[Capabilities] = _build_kite_capabilities()
 
     # ── Construction ─────────────────────────────────────────────────
     def __init__(self, alias: str) -> None:
