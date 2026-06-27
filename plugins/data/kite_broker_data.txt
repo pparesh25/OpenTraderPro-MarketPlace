@@ -112,7 +112,7 @@ def _build_kite_capabilities() -> Capabilities:
     running app supports it — additive and backward-compatible (an older app
     whose Capabilities lacks the field falls back to the base profile)."""
     base = dict(
-        segments=("NSE", "NSE_EQ", "BSE", "BSE_EQ", "NFO", "MCX", "CDS"),
+        segments=("NSE", "NSE_EQ", "BSE", "BSE_EQ", "NFO", "BFO", "MCX", "CDS", "BCD"),
         realtime=True,
         historical=True,
         search=True,
@@ -436,7 +436,7 @@ class KiteSession:
     def _load_instruments(self) -> None:
         if not self._authenticated or not self._kite:
             return
-        for exch in ("NSE", "BSE", "MCX", "NFO", "CDS"):
+        for exch in ("NSE", "BSE", "MCX", "NFO", "BFO", "CDS", "BCD"):
             try:
                 with self.api_lock:
                     instruments = self._kite.instruments(exch)
@@ -495,7 +495,7 @@ class KiteSession:
         exch = self._exch_lookup.get(symbol)
         if exch:
             return exch
-        for e in ("NSE", "NFO", "MCX", "CDS", "BSE"):
+        for e in ("NSE", "NFO", "BFO", "MCX", "CDS", "BCD", "BSE"):
             if f"{e}:{symbol}" in self._token_cache:
                 return e
         return None
@@ -849,7 +849,7 @@ class DataPlugin(DataPluginV2):
         clean_symbol = symbol.split(".")[0] if "." in symbol else symbol
         token = self._session.resolve_token(clean_symbol, exchange or "NSE")
         if token is None and not exchange:
-            for exch in ("NSE", "BSE", "MCX", "NFO", "CDS"):
+            for exch in ("NSE", "BSE", "MCX", "NFO", "BFO", "CDS", "BCD"):
                 token = self._session.resolve_token(clean_symbol, exch)
                 if token is not None:
                     exchange = exch
@@ -894,7 +894,7 @@ class DataPlugin(DataPluginV2):
         return bars
 
     # ── Symbol search ────────────────────────────────────────────────
-    _ALL_EXCHANGES: ClassVar[tuple[str, ...]] = ("NSE", "BSE", "MCX", "NFO", "CDS")
+    _ALL_EXCHANGES: ClassVar[tuple[str, ...]] = ("NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD")
 
     def search_symbols(
         self,
@@ -934,7 +934,8 @@ class DataPlugin(DataPluginV2):
     _SEGMENT_EXCHANGE: ClassVar[dict[str, str]] = {
         "NSE_EQ": "NSE", "NSE": "NSE",
         "BSE_EQ": "BSE", "BSE": "BSE",
-        "NFO": "NFO", "MCX": "MCX", "CDS": "CDS",
+        "NFO": "NFO", "BFO": "BFO",
+        "MCX": "MCX", "CDS": "CDS", "BCD": "BCD",
     }
 
     def fetch_instruments(self, segment: str) -> list[SymbolRecord]:
@@ -1021,7 +1022,7 @@ class DataPlugin(DataPluginV2):
         for sym, exch in symbols:
             token = self._session.resolve_token(sym, exch)
             if token is None:
-                for e in ("NSE", "BSE", "NFO", "MCX", "CDS"):
+                for e in ("NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"):
                     token = self._session.resolve_token(sym, e)
                     if token is not None:
                         break
@@ -1063,7 +1064,7 @@ class DataPlugin(DataPluginV2):
         for sym, exch in symbols:
             token = self._session.resolve_token(sym, exch)
             if token is None:
-                for e in ("NSE", "BSE", "NFO", "MCX", "CDS"):
+                for e in ("NSE", "BSE", "NFO", "BFO", "MCX", "CDS", "BCD"):
                     token = self._session.resolve_token(sym, e)
                     if token is not None:
                         break
