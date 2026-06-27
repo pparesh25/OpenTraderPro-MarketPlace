@@ -959,6 +959,7 @@ class DataPlugin(DataPluginV2):
                 "Instrument list not yet loaded — try again in a moment."
             )
         records: list[SymbolRecord] = []
+        unmapped_mcx: set[str] = set()
         for row in rows:
             itype_str = str(row.get("instrument_type", "EQ")).upper()
             # Finer dump segment splits each derivative exchange into FUT/OPT
@@ -973,7 +974,15 @@ class DataPlugin(DataPluginV2):
             is_derivative = itype.is_derivative
             is_option = itype is InstrumentType.OPTION
             name_str = str(row.get("name", "")).upper()
-            sector = _MCX_SECTORS.get(name_str) if exch == "MCX" else None
+            if exch == "MCX" and name_str:
+                # Unmapped commodities fall into a visible "Other" bucket so the
+                # builder's data-driven sector facet still lists them (distinct_
+                # sectors() drops NULL); collect names for a maintenance warning.
+                sector = _MCX_SECTORS.get(name_str, "Other")
+                if name_str not in _MCX_SECTORS:
+                    unmapped_mcx.add(name_str)
+            else:
+                sector = None
             records.append(SymbolRecord(
                 symbol=str(row.get("tradingsymbol", "")),
                 exchange=exch,
@@ -991,6 +1000,11 @@ class DataPlugin(DataPluginV2):
                 underlying_exchange=exch if is_derivative else None,
                 sector=sector,
             ))
+        if unmapped_mcx:
+            logger.warning(
+                "kite_broker: %d unmapped MCX commodities bucketed as 'Other': %s",
+                len(unmapped_mcx), ", ".join(sorted(unmapped_mcx)),
+            )
         return records
 
     # ── Realtime ─────────────────────────────────────────────────────
