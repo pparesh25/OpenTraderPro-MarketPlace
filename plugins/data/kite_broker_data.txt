@@ -1239,6 +1239,18 @@ _MCX_SECTORS: dict[str, str] = {
     "COTTONREF": "Agri-Commodity",
     "MENTHAOIL": "Agri-Commodity",
     "KAPAS": "Agri-Commodity",
+    # Mini / variant contracts (Zerodha tradingsymbol roots) — same sector as
+    # their parent commodity; anything still unmapped falls to "Other" + a warn.
+    "GOLDTEN": "Bullion",
+    "SILVER100": "Bullion",
+    "ALUMINI": "Base Metals",
+    "LEADMINI": "Base Metals",
+    "ZINCMINI": "Base Metals",
+    "STEELREBAR": "Base Metals",
+    "NATGASMINI": "Energy",
+    "ELECDMBL": "Energy",
+    "CARDAMOM": "Agri-Commodity",
+    "COTTONOIL": "Agri-Commodity",
     "MCXMETLDEX": "Index",
     "MCXBULLDEX": "Index",
 }
