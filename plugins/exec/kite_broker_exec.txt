@@ -365,7 +365,7 @@ class KiteSession:
     def _load_instruments(self) -> None:
         if not self._authenticated or not self._kite:
             return
-        for exch in ("NSE", "BSE", "MCX", "NFO", "CDS"):
+        for exch in ("NSE", "BSE", "MCX", "NFO", "BFO", "CDS", "BCD"):
             try:
                 with self.api_lock:
                     instruments = self._kite.instruments(exch)
@@ -424,7 +424,7 @@ class KiteSession:
         exch = self._exch_lookup.get(symbol)
         if exch:
             return exch
-        for e in ("NSE", "NFO", "MCX", "CDS", "BSE"):
+        for e in ("NSE", "NFO", "BFO", "MCX", "CDS", "BCD", "BSE"):
             if f"{e}:{symbol}" in self._token_cache:
                 return e
         return None
