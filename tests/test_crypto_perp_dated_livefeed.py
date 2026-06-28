@@ -129,7 +129,9 @@ class _RecordingWS:
         self.calls.append(("spot", symbol))
         return f"spot:{symbol}"
 
-    def start_symbol_ticker_futures_socket(self, callback, symbol, futures_type) -> str:
+    def start_individual_symbol_ticker_futures_socket(
+        self, callback, symbol, futures_type
+    ) -> str:
         self.calls.append((str(futures_type), symbol))
         return f"fut:{symbol}"
 
@@ -205,3 +207,56 @@ class TestLiveSocketRouting:
         assert captured, "no tick emitted"
         tick = captured[0]
         assert tick.prev_close == pytest.approx(100.0)   # 110 - 10
+
+    def test_futures_ticker_envelope_is_unwrapped(self):
+        """The futures socket delivers a {'stream','data'} envelope, not the raw
+        payload. _on_ticker_message must unwrap it or every futures tick is
+        dropped by the 's' not in msg guard (the no-live-updates bug)."""
+        ns = _load_ns()
+        p = self._plugin(ns, _RecordingWS())
+        captured: list = []
+        p._on_tick = captured.append
+        p._symbol_exchange = {"BTCUSDT": "USDM_FUTURES"}
+        p._on_ticker_message({
+            "stream": "btcusdt@ticker",
+            "data": {"e": "24hrTicker", "s": "BTCUSDT", "c": "111",
+                     "p": "11", "o": "100", "h": "120", "l": "95",
+                     "v": "5000", "E": 2},
+        })
+        assert captured, "wrapped futures tick was dropped"
+        tick = captured[0]
+        assert tick.symbol == "BTCUSDT"
+        assert tick.exchange == "USDM_FUTURES"
+        assert tick.price == pytest.approx(111.0)
+        assert tick.prev_close == pytest.approx(100.0)   # 111 - 11
+
+
+class _PaginatingCoinClient:
+    """Fake dapi client: returns 1m candles aligned to the minute, ≤limit/page."""
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def futures_coin_klines(self, symbol, interval, startTime, endTime, limit):
+        self.calls.append(startTime)
+        t = ((startTime + 59999) // 60000) * 60000      # first minute >= start
+        out = []
+        while t < endTime and len(out) < limit:
+            out.append([t, "1", "2", "0", "1", "10"])
+            t += 60000
+        return out
+
+
+class TestCoinMHistoricalPagination:
+    def test_pages_until_caught_up_without_dupes(self):
+        ns = _load_ns()
+        paginate = ns["_coin_m_historical_klines"]
+        client = _PaginatingCoinClient()
+        # 3500 one-minute candles → 1500 + 1500 + 500 across 3 pages.
+        end = 3500 * 60000
+        bars = paginate(client, "BTCUSD_PERP", "1m", 0, end, limit=1500)
+        opens = [b[0] for b in bars]
+        assert len(bars) == 3500
+        assert len(set(opens)) == 3500          # no duplicate candles across pages
+        assert opens == sorted(opens)           # monotonic
+        assert len(client.calls) == 3           # paginated, then stopped on short page

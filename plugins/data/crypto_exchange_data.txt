@@ -749,18 +749,27 @@ class DataPlugin(DataPluginV2):
         start_ms = str(int(_to_utc_midnight(start).timestamp() * 1000))
         end_ms = str(int(_to_utc_end_of_day(end).timestamp() * 1000))
 
-        fetcher = {
-            SPOT:  "get_historical_klines",
-            USDM:  "futures_historical_klines",
-            COINM: "futures_coin_historical_klines",
-        }[segment]
-
         client = self._session.client
         try:
             with self._session.api_lock:
-                klines = getattr(client, fetcher)(
-                    symbol.upper(), interval, start_ms, end_ms,
-                )
+                if segment == COINM:
+                    # python-binance has NO ``futures_coin_historical_klines``
+                    # helper, and ``get_historical_klines(klines_type=
+                    # FUTURES_COIN)`` builds a request the dapi endpoint rejects
+                    # (-4088 "Maximum time interval is 200 days") — so page the
+                    # raw ``futures_coin_klines`` (≤1500 candles/call) ourselves.
+                    klines = _coin_m_historical_klines(
+                        client, symbol.upper(), interval,
+                        int(start_ms), int(end_ms),
+                    )
+                else:
+                    fetcher = {
+                        SPOT: "get_historical_klines",
+                        USDM: "futures_historical_klines",
+                    }[segment]
+                    klines = getattr(client, fetcher)(
+                        symbol.upper(), interval, start_ms, end_ms,
+                    )
         except Exception as exc:
             logger.error(
                 "Binance[%s] historical %s:%s failed: %s",
@@ -972,18 +981,21 @@ class DataPlugin(DataPluginV2):
         """Start the right per-symbol 24h ticker socket for ``exchange``'s
         Binance venue and return its connection key.
 
-        F-S2-bin-futures-ws — USD-M / COIN-M futures get the FUTURES ticker
-        stream (``start_symbol_ticker_futures_socket`` with ``futures_type``
-        routing to fstream vs dstream); everything else (spot) keeps the spot
-        ticker. The emitted payload shape is the same (``c``/``o``/``h``/``l``/
-        ``v``) so ``_on_ticker_message`` handles both; futures omit ``b``/``a``
-        (bid/ask) and ``x`` (prev close), which are tolerated there. Falls back
-        to the spot socket when ``FuturesType`` is unavailable (very old
-        python-binance) so the feed degrades rather than breaks."""
+        F-S2-bin-futures-ws — USD-M / COIN-M futures get the 24h FUTURES ticker
+        stream via ``start_individual_symbol_ticker_futures_socket`` (with
+        ``futures_type`` routing to fstream vs dstream). NOTE: the similarly
+        named ``start_symbol_ticker_futures_socket`` is the BOOK ticker
+        (bid/ask only, no last/OHLC) — using it gave ``price=0`` and no live
+        bars; the *individual* variant is the ``<symbol>@ticker`` 24h stream
+        carrying ``c``/``o``/``h``/``l``/``v`` like spot, so ``_on_ticker_message``
+        handles both (it unwraps the futures combined-stream envelope). Futures
+        omit ``b``/``a`` (bid/ask) and ``x`` (prev close), which are tolerated
+        there. Falls back to the spot socket when ``FuturesType`` is unavailable
+        (very old python-binance) so the feed degrades rather than breaks."""
         seg = _resolve_segment(exchange)
         if FuturesType is not None and seg in (USDM, COINM):
             ftype = FuturesType.USD_M if seg == USDM else FuturesType.COIN_M
-            return self._bm.start_symbol_ticker_futures_socket(
+            return self._bm.start_individual_symbol_ticker_futures_socket(
                 callback=self._on_ticker_message,
                 symbol=symbol_lower,
                 futures_type=ftype,
@@ -1040,6 +1052,14 @@ class DataPlugin(DataPluginV2):
         """Convert a Binance !ticker payload to :class:`Tick` and dispatch."""
         if not isinstance(msg, dict):
             return
+        # F-S2-bin-futures-ws — the FUTURES ticker socket
+        # (start_symbol_ticker_futures_socket, USD-M + COIN-M) delivers a
+        # combined-stream ENVELOPE ``{"stream": "<sym>@ticker", "data": {…}}``,
+        # whereas the SPOT socket delivers the raw payload. Unwrap so the field
+        # reads below work for both; pre-unwrap every USD-M/COIN-M tick was
+        # dropped by the ``"s" not in msg`` guard (no live futures updates).
+        if "stream" in msg and isinstance(msg.get("data"), dict):
+            msg = msg["data"]
         if msg.get("e") == "error" or "s" not in msg:
             return
         cb = self._on_tick
@@ -1172,6 +1192,59 @@ def _resolve_segment(exchange: str) -> str:
     if e in (COINM, "COINM", "COINM_FUTURES", "COIN_M", "COIN_M_FUTURES"):
         return COINM
     return SPOT
+
+
+_INTERVAL_UNIT_MS = {
+    "m": 60_000, "h": 3_600_000, "d": 86_400_000,
+    "w": 604_800_000, "M": 2_592_000_000,        # month ≈ 30d (windowing only)
+}
+
+
+def _interval_ms(interval: str) -> int:
+    """Binance interval string (``"1m"``, ``"4h"``, ``"1d"`` …) → milliseconds.
+    Used only to size the COIN-M kline page window; unknown → 1m."""
+    try:
+        return int(interval[:-1]) * _INTERVAL_UNIT_MS[interval[-1]]
+    except (ValueError, KeyError, IndexError):
+        return 60_000
+
+
+def _coin_m_historical_klines(
+    client, symbol: str, interval: str,
+    start_ms: int, end_ms: int, limit: int = 1500,
+) -> list:
+    """Paginated COIN-M (dapi) historical klines over ``[start_ms, end_ms]``.
+
+    python-binance ships no ``futures_coin_historical_klines`` wrapper, and its
+    ``get_historical_klines(klines_type=FUTURES_COIN)`` paginator builds a
+    request the dapi endpoint rejects with ``-4088`` regardless of the window —
+    so we page the raw ``futures_coin_klines`` (≤1500 candles/call) ourselves.
+
+    The dapi klines endpoint, given a [startTime, endTime] window wider than
+    ``limit`` candles, returns the MOST RECENT ``limit`` (anchored to endTime),
+    NOT the first ``limit`` from startTime — so a naive "startTime forward" loop
+    only ever fetches the last page. We instead request explicit windows of
+    exactly ``limit`` candles (``cursor → cursor + step*limit``), which always
+    returns forward from ``cursor``, then advance one candle past the last open.
+    """
+    step = _interval_ms(interval)
+    out: list = []
+    cursor = int(start_ms)
+    end = int(end_ms)
+    while cursor < end:
+        window_end = min(cursor + step * limit, end)
+        chunk = client.futures_coin_klines(
+            symbol=symbol, interval=interval,
+            startTime=cursor, endTime=window_end, limit=limit,
+        )
+        if not chunk:
+            break
+        out.extend(chunk)
+        nxt = int(chunk[-1][0]) + step     # next candle after this page's last
+        if nxt <= cursor:                  # no forward progress → stop
+            break
+        cursor = nxt
+    return out
 
 
 def _kline_to_bar(k: list) -> OhlcvBar:
