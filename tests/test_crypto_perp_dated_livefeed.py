@@ -147,6 +147,11 @@ class _RecordingWS:
         # teardown is synchronous and the rebuilt manager can't overlap it.
         self.joined_timeout = timeout
 
+    def is_alive(self) -> bool:
+        # A cleanly stopped+joined reader reports not-alive; _teardown_ws warns
+        # only when this stays True (the rare wedged-reader case).
+        return False
+
 
 class _WsSession:
     is_authenticated = True
@@ -319,6 +324,22 @@ class TestResetRealtime:
 
         assert p._bm is ws2                            # fresh manager
         assert ws2.calls == [("spot", "btcusdt")]      # single rebuilt socket
+
+    def test_warns_when_reader_survives_join(self, caplog):
+        import logging
+
+        class _WedgedWS(_RecordingWS):
+            def is_alive(self):
+                return True                            # reader didn't die in time
+
+        ns = _load_ns()
+        ws = _WedgedWS()
+        p = self._plugin(ns, ws)
+        p.subscribe_realtime([("BTCUSDT", "CRYPTO_SPOT")], on_tick=lambda _t: None)
+        with caplog.at_level(logging.WARNING):
+            p.reset_realtime()
+        assert ws.stopped is True
+        assert any("still alive after 6s join" in r.message for r in caplog.records)
 
     def test_reset_with_no_feed_is_safe(self):
         # No subscribe ever ran (or already torn down) → reset_realtime must

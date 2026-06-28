@@ -1051,6 +1051,17 @@ class DataPlugin(DataPluginV2):
                 joiner = getattr(bm, "join", None)
                 if callable(joiner):
                     joiner(timeout=6.0)
+                # If the reader didn't die within the bound, the fresh manager
+                # the caller builds next can briefly overlap it (a transient
+                # repeat) — surface it so the rare wedged-reader case is
+                # diagnosable rather than silent.
+                alive = getattr(bm, "is_alive", None)
+                if callable(alive) and alive():
+                    logger.warning(
+                        "Binance[%s] ws reader still alive after 6s join on "
+                        "teardown — the rebuilt feed may briefly double-deliver "
+                        "until it exits.", self.alias,
+                    )
             except Exception as exc:                     # pragma: no cover
                 logger.debug(
                     "Binance[%s] ws manager teardown failed: %s",
