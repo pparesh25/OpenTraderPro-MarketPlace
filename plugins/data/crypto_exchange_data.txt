@@ -118,6 +118,14 @@ def _build_crypto_capabilities() -> Capabilities:
 try:
     from binance.client import Client
     from binance.exceptions import BinanceAPIException
+    # FuturesType selects the USD-M vs COIN-M futures venue for the live ticker
+    # socket (see subscribe_realtime). Optional — older python-binance still
+    # exposes it from binance.enums; absent → futures live feed falls back to
+    # the spot socket (the prior behaviour).
+    try:
+        from binance.enums import FuturesType
+    except ImportError:                                        # pragma: no cover
+        FuturesType = None                                     # type: ignore[assignment,misc]
     try:
         from binance.ws.streams import (             # python-binance ≥1.0
             BinanceSocketManager, ThreadedWebsocketManager,
@@ -135,6 +143,7 @@ except ImportError as _bin_import_err:
     Client = None                            # type: ignore[assignment,misc]
     BinanceSocketManager = None              # type: ignore[assignment,misc]
     ThreadedWebsocketManager = None          # type: ignore[assignment,misc]
+    FuturesType = None                       # type: ignore[assignment,misc]
     BinanceAPIException = Exception    # type: ignore[misc,assignment]
     logger.info(
         "python-binance import failed (%s: %s) — binance plugin reports "
@@ -835,12 +844,21 @@ class DataPlugin(DataPluginV2):
                 expiry: date | None = None
                 underlying: str | None = None
             else:
-                perp = str(info.get("contractType", "")).upper() == "PERPETUAL"
+                # Perp vs dated is decided by whether a REAL delivery date
+                # exists — NOT by the ``contractType`` string. Binance ships
+                # tokenized-equity perpetuals as ``contractType=="TRADIFI_PERPETUAL"``
+                # (and may add further spellings), which a literal ``=="PERPETUAL"``
+                # test wrongly bucketed as dated ``CRYPTO_FUTURE`` carrying a NULL
+                # expiry — a self-contradictory "dated future with no date" that
+                # poisoned the builder's perp-vs-dated facet for ~100 USD-M rows.
+                # A dated contract always has a parseable ``deliveryDate``;
+                # ``_coerce_delivery`` returns None for the perpetual year-2100
+                # sentinel, so it is the single source of truth here.
+                expiry = _coerce_delivery(info.get("deliveryDate"))
                 itype = (
-                    InstrumentType.CRYPTO_PERP if perp
-                    else InstrumentType.CRYPTO_FUTURE
+                    InstrumentType.CRYPTO_FUTURE if expiry is not None
+                    else InstrumentType.CRYPTO_PERP
                 )
-                expiry = None if perp else _coerce_delivery(info.get("deliveryDate"))
                 underlying = base or None
             records.append(SymbolRecord(
                 symbol=sym,
@@ -913,15 +931,12 @@ class DataPlugin(DataPluginV2):
                     self._symbol_exchange[u] = exch
                 continue
             try:
-                # F-S2-bin-twm — callback first, symbol second (TWM
-                # signature). The legacy BSM order silently passed
-                # ``symbol`` as ``callback`` causing a runtime
-                # AttributeError on dispatch (or worse, infinite
-                # recursion on str().__call__()).
-                key = self._bm.start_symbol_ticker_socket(
-                    callback=self._on_ticker_message,
-                    symbol=u.lower(),
-                )
+                # F-S2-bin-futures-ws — start the ticker socket on the venue the
+                # symbol's exchange resolves to (spot vs USD-M vs COIN-M). Pre-fix
+                # every symbol used the SPOT stream, so a USD-M/COIN-M futures
+                # watchlist (now buildable via the segment builder) charted the
+                # wrong spot price or got no ticks at all.
+                key = self._start_ticker_socket(u.lower(), exch)
                 self._conn_keys[u] = key
                 # F-S2-bin-tickexch — remember the exchange string the
                 # caller used so ``_on_ticker_message`` can stamp it on
@@ -935,8 +950,33 @@ class DataPlugin(DataPluginV2):
                 )
 
         logger.info(
-            "Binance[%s] subscribed %d spot symbols",
+            "Binance[%s] subscribed %d symbols (spot + USD-M/COIN-M futures)",
             self.alias, len(self._conn_keys),
+        )
+
+    def _start_ticker_socket(self, symbol_lower: str, exchange: str) -> object:
+        """Start the right per-symbol 24h ticker socket for ``exchange``'s
+        Binance venue and return its connection key.
+
+        F-S2-bin-futures-ws — USD-M / COIN-M futures get the FUTURES ticker
+        stream (``start_symbol_ticker_futures_socket`` with ``futures_type``
+        routing to fstream vs dstream); everything else (spot) keeps the spot
+        ticker. The emitted payload shape is the same (``c``/``o``/``h``/``l``/
+        ``v``) so ``_on_ticker_message`` handles both; futures omit ``b``/``a``
+        (bid/ask) and ``x`` (prev close), which are tolerated there. Falls back
+        to the spot socket when ``FuturesType`` is unavailable (very old
+        python-binance) so the feed degrades rather than breaks."""
+        seg = _resolve_segment(exchange)
+        if FuturesType is not None and seg in (USDM, COINM):
+            ftype = FuturesType.USD_M if seg == USDM else FuturesType.COIN_M
+            return self._bm.start_symbol_ticker_futures_socket(
+                callback=self._on_ticker_message,
+                symbol=symbol_lower,
+                futures_type=ftype,
+            )
+        return self._bm.start_symbol_ticker_socket(
+            callback=self._on_ticker_message,
+            symbol=symbol_lower,
         )
 
     def unsubscribe_realtime(self, symbols: list[tuple[str, str]]) -> None:
@@ -1033,6 +1073,19 @@ class DataPlugin(DataPluginV2):
         #   o = open price (24h)         h = high price (24h)
         #   l = low price (24h)          x = previous day's close price
         #   c = current/last close price (= ``price`` we already use)
+        # The SPOT ticker carries yesterday's close in ``x``; the FUTURES ticker
+        # has no ``x`` but carries ``p`` = 24h price change, so the 24h baseline
+        # (the "prev close" Market Watch computes change% against) = last ``c`` −
+        # ``p``. Derive it so change% is correct for USD-M/COIN-M too, not just
+        # spot. (``p`` can be negative, so it must NOT pass through
+        # ``_safe_float_or_none``, which drops non-positive values.)
+        prev_close = _safe_float_or_none(msg.get("x"))
+        if prev_close is None and msg.get("p") is not None:
+            try:
+                derived = float(msg["c"]) - float(msg["p"])
+            except (TypeError, ValueError, KeyError):
+                derived = None
+            prev_close = derived if (derived and derived > 0) else None
         try:
             cb(Tick(
                 symbol=symbol,
@@ -1045,7 +1098,7 @@ class DataPlugin(DataPluginV2):
                 day_open=_safe_float_or_none(msg.get("o")),
                 day_high=_safe_float_or_none(msg.get("h")),
                 day_low=_safe_float_or_none(msg.get("l")),
-                prev_close=_safe_float_or_none(msg.get("x")),
+                prev_close=prev_close,
             ))
         except Exception:                                # pragma: no cover
             logger.exception("binance on_tick raised")
