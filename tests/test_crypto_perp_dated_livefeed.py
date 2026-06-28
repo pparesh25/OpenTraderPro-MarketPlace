@@ -176,6 +176,19 @@ class TestLiveSocketRouting:
         assert "USD_M" in kind_by_sym["ethusdt"]
         assert "COIN_M" in kind_by_sym["btcusd_perp"]
 
+    def test_falls_back_to_spot_and_warns_when_futurestype_missing(self, caplog):
+        import logging
+        ns = _load_ns()
+        ns["FuturesType"] = None          # simulate a too-old python-binance
+        ws = _RecordingWS()
+        p = self._plugin(ns, ws)
+        with caplog.at_level(logging.WARNING):
+            p.subscribe_realtime([("ETHUSDT", "USDM_FUTURES")], on_tick=lambda _t: None)
+        # No futures socket available → fell back to the spot socket...
+        assert ws.calls == [("spot", "ethusdt")]
+        # ...but the silent degradation is now surfaced as a warning.
+        assert any("too old to expose FuturesType" in r.message for r in caplog.records)
+
     def test_futures_ticker_prev_close_derived_for_change_pct(self):
         """The futures ticker has no 'x' (prev close); _on_ticker_message derives
         it from c - p (24h change) so Market Watch change% works for futures."""

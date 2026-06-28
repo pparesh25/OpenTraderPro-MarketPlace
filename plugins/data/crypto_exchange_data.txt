@@ -949,6 +949,20 @@ class DataPlugin(DataPluginV2):
                     self.alias, u, exc,
                 )
 
+        # F-S2-bin-futures-ws — surface the silent-degradation path: if this
+        # python-binance is too old to expose FuturesType, USD-M/COIN-M symbols
+        # fell back to the SPOT socket above (wrong price / no ticks for futures),
+        # which would otherwise look like a network issue. Warn once per call.
+        if FuturesType is None and any(
+            _resolve_segment(exch) in (USDM, COINM) for _sym, exch in symbols
+        ):
+            logger.warning(
+                "Binance[%s] python-binance is too old to expose FuturesType — "
+                "USD-M/COIN-M symbols fell back to the SPOT ticker stream (wrong "
+                "price for spot-twinned contracts, no ticks for futures-only "
+                "ones). Upgrade python-binance to restore the futures live feed.",
+                self.alias,
+            )
         logger.info(
             "Binance[%s] subscribed %d symbols (spot + USD-M/COIN-M futures)",
             self.alias, len(self._conn_keys),
