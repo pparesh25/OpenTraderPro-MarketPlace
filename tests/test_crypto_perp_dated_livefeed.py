@@ -154,7 +154,6 @@ class TestLiveSocketRouting:
         p._session = _WsSession(ws)
         p._bm = None
         p._conn_keys = {}
-        p._symbol_exchange = {}
         p._on_tick = None
         p._last_cum_volume = {}
         return p
@@ -178,6 +177,33 @@ class TestLiveSocketRouting:
         assert "USD_M" in kind_by_sym["ethusdt"]
         assert "COIN_M" in kind_by_sym["btcusd_perp"]
 
+    def test_same_symbol_two_venues_get_separate_sockets(self):
+        # F-S2-bin-multivenue — BTCUSDT exists on BOTH spot and USD-M. Pre-fix
+        # the symbol-only dedup created ONE socket; now each venue gets its own.
+        ns = _load_ns()
+        ws = _RecordingWS()
+        p = self._plugin(ns, ws)
+        p.subscribe_realtime(
+            [("BTCUSDT", "CRYPTO_SPOT"), ("BTCUSDT", "USDM_FUTURES")],
+            on_tick=lambda _t: None,
+        )
+        kinds = sorted(kind for kind, sym in ws.calls if sym == "btcusdt")
+        assert len(kinds) == 2                       # two sockets, not deduped
+        assert any(k == "spot" for k in kinds)
+        assert any("USD_M" in k for k in kinds)
+
+    def test_tick_stamps_the_bound_venue_per_socket(self):
+        # The callback bound to each socket stamps its own venue, so the spot
+        # and USD-M streams for the same symbol emit correctly-tagged ticks.
+        ns = _load_ns()
+        p = self._plugin(ns, _RecordingWS())
+        ticks: list = []
+        p._on_tick = ticks.append
+        payload = {"e": "24hrTicker", "s": "BTCUSDT", "c": "100", "v": "1", "E": 1}
+        p._on_ticker_message(dict(payload), "CRYPTO_SPOT")
+        p._on_ticker_message(dict(payload), "USDM_FUTURES")
+        assert {t.exchange for t in ticks} == {"CRYPTO_SPOT", "USDM_FUTURES"}
+
     def test_falls_back_to_spot_and_warns_when_futurestype_missing(self, caplog):
         import logging
         ns = _load_ns()
@@ -198,12 +224,11 @@ class TestLiveSocketRouting:
         p = self._plugin(ns, _RecordingWS())
         captured: list = []
         p._on_tick = captured.append
-        p._symbol_exchange = {"ETHUSDT": "USDM_FUTURES"}
         # Futures 24h ticker payload: last 'c', 24h change 'p', no 'x'.
         p._on_ticker_message({
             "e": "24hrTicker", "s": "ETHUSDT", "c": "110", "p": "10",
             "o": "100", "h": "115", "l": "95", "v": "1000", "E": 1,
-        })
+        }, "USDM_FUTURES")
         assert captured, "no tick emitted"
         tick = captured[0]
         assert tick.prev_close == pytest.approx(100.0)   # 110 - 10
@@ -216,13 +241,12 @@ class TestLiveSocketRouting:
         p = self._plugin(ns, _RecordingWS())
         captured: list = []
         p._on_tick = captured.append
-        p._symbol_exchange = {"BTCUSDT": "USDM_FUTURES"}
         p._on_ticker_message({
             "stream": "btcusdt@ticker",
             "data": {"e": "24hrTicker", "s": "BTCUSDT", "c": "111",
                      "p": "11", "o": "100", "h": "120", "l": "95",
                      "v": "5000", "E": 2},
-        })
+        }, "USDM_FUTURES")
         assert captured, "wrapped futures tick was dropped"
         tick = captured[0]
         assert tick.symbol == "BTCUSDT"

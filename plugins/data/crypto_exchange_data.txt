@@ -607,20 +607,22 @@ class DataPlugin(DataPluginV2):
         )
         self._configured = False
 
-        # Realtime state (spot-only).
+        # Realtime state.
         self._bm: Any | None = None
-        self._conn_keys: dict[str, Any] = {}        # "BTCUSDT" → socket key
-        # F-S2-bin-tickexch — remember the exchange string each symbol
-        # was subscribed under, so the emitted ``Tick.exchange`` matches
-        # the ``SubscriptionKey`` the RealtimeManager keyed its builder
-        # on. Pre-fix the plugin emitted ``exchange=SPOT`` (segment
-        # string "CRYPTO_SPOT") but the watchlist + subscribe flow used
-        # exchange="BINANCE" — every tick became an orphan
-        # (``no builder; active subs ...`` log line) and live bars
-        # never built on the chart.
-        self._symbol_exchange: dict[str, str] = {}
+        # F-S2-bin-multivenue — key by (SYMBOL, EXCHANGE), not symbol alone:
+        # the SAME base symbol exists on multiple venues (e.g. BTCUSDT on spot
+        # AND USD-M). Pre-fix the symbol-only key deduped the second venue's
+        # subscribe, so one chart (spot or futures) got the OTHER venue's price
+        # or no ticks. Each (symbol, exchange) now gets its own socket, and the
+        # callback is bound to the exchange it subscribed under (so the emitted
+        # ``Tick.exchange`` matches the RealtimeManager's builder key — what the
+        # F-S2-bin-tickexch ``_symbol_exchange`` map used to do per-symbol, now
+        # per-socket and collision-safe).
+        self._conn_keys: dict[tuple[str, str], Any] = {}   # (SYMBOL, EXCHANGE) → key
         self._on_tick: Callable[[Tick], None] | None = None
-        self._last_cum_volume: dict[str, float] = {}   # delta-volume tracker
+        # delta-volume tracker, keyed (SYMBOL, EXCHANGE) so the same symbol on
+        # two venues doesn't share (and corrupt) the cumulative-volume baseline.
+        self._last_cum_volume: dict[tuple[str, str], float] = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────
     def configure(
@@ -931,31 +933,25 @@ class DataPlugin(DataPluginV2):
 
         for sym, exch in symbols:
             u = sym.upper()
-            if u in self._conn_keys:
-                # Even on dedup, refresh the exchange map in case the
-                # caller resubscribes the same symbol under a different
-                # exchange alias (rare but possible across watchlist
-                # reloads).
-                if exch:
-                    self._symbol_exchange[u] = exch
-                continue
+            ex = exch or "BINANCE"      # legacy / orphan-recovery default
+            ckey = (u, ex)
+            if ckey in self._conn_keys:
+                continue                # this (symbol, venue) already streaming
             try:
                 # F-S2-bin-futures-ws — start the ticker socket on the venue the
                 # symbol's exchange resolves to (spot vs USD-M vs COIN-M). Pre-fix
                 # every symbol used the SPOT stream, so a USD-M/COIN-M futures
                 # watchlist (now buildable via the segment builder) charted the
-                # wrong spot price or got no ticks at all.
-                key = self._start_ticker_socket(u.lower(), exch)
-                self._conn_keys[u] = key
-                # F-S2-bin-tickexch — remember the exchange string the
-                # caller used so ``_on_ticker_message`` can stamp it on
-                # the emitted Tick. Falls back to "BINANCE" if caller
-                # passed empty (legacy callers / orphan-recovery paths).
-                self._symbol_exchange[u] = exch or "BINANCE"
+                # wrong spot price or got no ticks at all. The callback is bound
+                # to ``ex`` so the emitted Tick carries the venue this socket was
+                # subscribed under (F-S2-bin-multivenue — collision-safe vs the
+                # old per-symbol exchange map).
+                key = self._start_ticker_socket(u.lower(), ex)
+                self._conn_keys[ckey] = key
             except Exception as exc:                     # pragma: no cover
                 logger.warning(
-                    "Binance[%s] ws subscribe %s failed: %s",
-                    self.alias, u, exc,
+                    "Binance[%s] ws subscribe %s@%s failed: %s",
+                    self.alias, u, ex, exc,
                 )
 
         # F-S2-bin-futures-ws — surface the silent-degradation path: if this
@@ -991,37 +987,42 @@ class DataPlugin(DataPluginV2):
         handles both (it unwraps the futures combined-stream envelope). Futures
         omit ``b``/``a`` (bid/ask) and ``x`` (prev close), which are tolerated
         there. Falls back to the spot socket when ``FuturesType`` is unavailable
-        (very old python-binance) so the feed degrades rather than breaks."""
+        (very old python-binance) so the feed degrades rather than breaks.
+
+        F-S2-bin-multivenue — the callback is bound to ``exchange`` so this
+        socket's ticks carry the venue they were subscribed under, even when the
+        SAME symbol also streams on another venue (e.g. BTCUSDT spot + USD-M)."""
+        cb = lambda m, _e=exchange: self._on_ticker_message(m, _e)   # noqa: E731
         seg = _resolve_segment(exchange)
         if FuturesType is not None and seg in (USDM, COINM):
             ftype = FuturesType.USD_M if seg == USDM else FuturesType.COIN_M
             return self._bm.start_individual_symbol_ticker_futures_socket(
-                callback=self._on_ticker_message,
+                callback=cb,
                 symbol=symbol_lower,
                 futures_type=ftype,
             )
         return self._bm.start_symbol_ticker_socket(
-            callback=self._on_ticker_message,
+            callback=cb,
             symbol=symbol_lower,
         )
 
     def unsubscribe_realtime(self, symbols: list[tuple[str, str]]) -> None:
         if self._bm is None:
             return
-        for sym, _exch in symbols:
+        for sym, exch in symbols:
             u = sym.upper()
-            key = self._conn_keys.pop(u, None)
-            # F-S2-bin-tickexch — drop the exchange-mapping entry too,
-            # so a later resubscribe (potentially under a different
-            # exchange alias) doesn't inherit the stale value.
-            self._symbol_exchange.pop(u, None)
+            # F-S2-bin-multivenue — drop ONLY this (symbol, venue) socket, not
+            # every venue the symbol streams on.
+            ckey = (u, exch or "BINANCE")
+            key = self._conn_keys.pop(ckey, None)
+            self._last_cum_volume.pop(ckey, None)
             if key is not None:
                 try:
                     self._bm.stop_socket(key)
                 except Exception as exc:                 # pragma: no cover
                     logger.debug(
-                        "Binance[%s] stop_socket(%s) failed: %s",
-                        self.alias, u, exc,
+                        "Binance[%s] stop_socket(%s@%s) failed: %s",
+                        self.alias, u, ckey[1], exc,
                     )
 
     def _teardown_ws(self) -> None:
@@ -1044,12 +1045,16 @@ class DataPlugin(DataPluginV2):
                 )
         self._bm = None
         self._conn_keys.clear()
-        self._symbol_exchange.clear()
         self._on_tick = None
         self._last_cum_volume.clear()
 
-    def _on_ticker_message(self, msg: dict) -> None:
-        """Convert a Binance !ticker payload to :class:`Tick` and dispatch."""
+    def _on_ticker_message(self, msg: dict, exchange: str = "BINANCE") -> None:
+        """Convert a Binance !ticker payload to :class:`Tick` and dispatch.
+
+        ``exchange`` is bound per-socket at subscribe time (F-S2-bin-multivenue)
+        so the emitted Tick carries the venue this stream was subscribed under —
+        matching the RealtimeManager's builder key even when the same symbol
+        also streams on another venue."""
         if not isinstance(msg, dict):
             return
         # F-S2-bin-futures-ws — the FUTURES ticker socket
@@ -1068,25 +1073,22 @@ class DataPlugin(DataPluginV2):
 
         symbol = str(msg["s"])
         # Binance "v" is cumulative 24h base volume — per-tick delta helps
-        # OHLCV bar-builders reconstruct real per-tick volume.
+        # OHLCV bar-builders reconstruct real per-tick volume. Keyed by
+        # (symbol, exchange) so the same symbol on two venues keeps separate
+        # cumulative baselines (F-S2-bin-multivenue).
+        vkey = (symbol, exchange)
         cum_vol = float(msg.get("v", 0.0))
-        prev = self._last_cum_volume.get(symbol, 0.0)
+        prev = self._last_cum_volume.get(vkey, 0.0)
         delta = max(0, int(cum_vol - prev)) if prev > 0 else 0
-        self._last_cum_volume[symbol] = cum_vol
+        self._last_cum_volume[vkey] = cum_vol
 
         ts_ms = msg.get("E") or msg.get("T") or int(time.time() * 1000)
         ts = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
 
-        # F-S2-bin-tickexch — emit the same exchange string the caller
-        # subscribed with so ``RealtimeManager._builders`` finds the
-        # match (key = (account_id, symbol, exchange)). Pre-fix this
-        # was hard-coded to ``SPOT`` ("CRYPTO_SPOT"), so a watchlist
-        # configured with ``exchange="BINANCE"`` got every tick logged
-        # as ``orphan tick`` and dropped before reaching the bar
-        # builder + chart. Fallback to "BINANCE" if the symbol map
-        # lacks the entry (defensive — should always be present after
-        # a successful subscribe_realtime call).
-        exchange = self._symbol_exchange.get(symbol, "BINANCE")
+        # F-S2-bin-tickexch / F-S2-bin-multivenue — ``exchange`` is the venue
+        # this socket was subscribed under (bound per-socket at subscribe time),
+        # so ``RealtimeManager._builders`` finds the match (key = (account_id,
+        # symbol, exchange)) even when the same symbol streams on two venues.
         # F-S2-bin-tickfields — Binance's individual symbol ticker WS
         # payload (``<symbol>@ticker``, 24h rolling) carries day OHLC +
         # previous-day close on every tick. Pre-fix the plugin built
