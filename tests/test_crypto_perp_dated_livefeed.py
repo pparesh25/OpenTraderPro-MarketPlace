@@ -121,6 +121,7 @@ class TestPerpDatedClassification:
 class _RecordingWS:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.stopped = False
 
     def start(self) -> None:
         pass
@@ -134,6 +135,11 @@ class _RecordingWS:
     ) -> str:
         self.calls.append((str(futures_type), symbol))
         return f"fut:{symbol}"
+
+    def stop(self) -> None:
+        # TWM.stop() joins the reader threads + closes the event loop; a
+        # zombie auto-reconnect reader dies with it.
+        self.stopped = True
 
 
 class _WsSession:
@@ -253,6 +259,68 @@ class TestLiveSocketRouting:
         assert tick.exchange == "USDM_FUTURES"
         assert tick.price == pytest.approx(111.0)
         assert tick.prev_close == pytest.approx(100.0)   # 111 - 11
+
+
+class TestResetRealtime:
+    """reset_realtime() — the reconnect-hygiene hook the host calls on a
+    re-login (RealtimeManager.resubscribe_account). It drops the WHOLE
+    websocket manager so a stale auto-reconnect reader can't keep
+    duplicating ticks into one BarBuilder ('the live bar repeats')."""
+
+    def _plugin(self, ns, ws):
+        DataPlugin = ns["DataPlugin"]
+        p = object.__new__(DataPlugin)
+        p.alias = "test"
+        p._session = _WsSession(ws)
+        p._bm = None
+        p._conn_keys = {}
+        p._on_tick = None
+        p._last_cum_volume = {}
+        return p
+
+    def test_reset_stops_manager_and_clears_all_socket_state(self):
+        ns = _load_ns()
+        ws = _RecordingWS()
+        p = self._plugin(ns, ws)
+        p.subscribe_realtime(
+            [("BTCUSDT", "CRYPTO_SPOT"), ("ETHUSDT", "USDM_FUTURES")],
+            on_tick=lambda _t: None,
+        )
+        assert p._bm is ws and p._conn_keys            # feed is up
+
+        p.reset_realtime()
+
+        assert ws.stopped is True                      # whole manager stopped
+        assert p._bm is None                           # no stale reuse next time
+        assert p._conn_keys == {}                       # per-socket keys cleared
+        assert p._last_cum_volume == {}                 # volume baselines cleared
+
+    def test_resubscribe_after_reset_builds_a_fresh_manager(self):
+        ns = _load_ns()
+        ws1 = _RecordingWS()
+        p = self._plugin(ns, ws1)
+        p.subscribe_realtime([("BTCUSDT", "CRYPTO_SPOT")], on_tick=lambda _t: None)
+
+        p.reset_realtime()
+        assert ws1.stopped is True
+
+        # The session hands out a brand-new manager on the next subscribe —
+        # exactly one clean socket, no carry-over from the stopped ws1.
+        ws2 = _RecordingWS()
+        p._session = _WsSession(ws2)
+        p.subscribe_realtime([("BTCUSDT", "CRYPTO_SPOT")], on_tick=lambda _t: None)
+
+        assert p._bm is ws2                            # fresh manager
+        assert ws2.calls == [("spot", "btcusdt")]      # single rebuilt socket
+
+    def test_reset_with_no_feed_is_safe(self):
+        # No subscribe ever ran (or already torn down) → reset_realtime must
+        # not raise on a None manager.
+        ns = _load_ns()
+        p = self._plugin(ns, _RecordingWS())
+        p.reset_realtime()                              # _bm is None
+        assert p._bm is None
+        assert p._conn_keys == {}
 
 
 class _PaginatingCoinClient:

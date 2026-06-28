@@ -1048,6 +1048,26 @@ class DataPlugin(DataPluginV2):
         self._on_tick = None
         self._last_cum_volume.clear()
 
+    def reset_realtime(self) -> None:
+        """Reconnect-hygiene hook called by ``RealtimeManager.resubscribe_
+        account`` on a re-login: drop the ENTIRE live websocket so the feed
+        restarts from a clean slate.
+
+        python-binance's ``ThreadedWebsocketManager`` runs its own internal
+        auto-reconnect. A SOCKS/network blip can leave a stale reader alive
+        that keeps streaming a DUPLICATE copy of every 24h-ticker frame into
+        the same ``BarBuilder`` — two unsynchronised streams whose differing
+        event-times defeat the builder's immediate-previous dedup, so the
+        in-progress bar's close (and the crosshair label's time) oscillate
+        "bar → tick → same bar → realtime → repeat". A plain re-subscribe
+        can't fix it: ``subscribe_realtime`` reuses ``self._bm`` and skips
+        every ``(symbol, venue)`` already in ``_conn_keys``, so it never
+        replaces the stale manager. Stopping the whole manager via
+        :meth:`_teardown_ws` joins those threads and clears the per-socket
+        bookkeeping; the caller re-subscribes immediately after, rebuilding
+        exactly one fresh socket per ``(symbol, venue)``."""
+        self._teardown_ws()
+
     def _on_ticker_message(self, msg: dict, exchange: str = "BINANCE") -> None:
         """Convert a Binance !ticker payload to :class:`Tick` and dispatch.
 
