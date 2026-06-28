@@ -1026,18 +1026,31 @@ class DataPlugin(DataPluginV2):
                     )
 
     def _teardown_ws(self) -> None:
-        if self._bm is not None:
+        bm = self._bm
+        if bm is not None:
             try:
                 # F-S2-bin-twm — TWM uses ``stop()``; the legacy BSM
                 # used ``close()`` which doesn't exist on TWM. Try
                 # ``stop()`` first, fall back for any non-TWM manager
                 # a future plugin variant might inject.
                 stopper = (
-                    getattr(self._bm, "stop", None)
-                    or getattr(self._bm, "close", None)
+                    getattr(bm, "stop", None)
+                    or getattr(bm, "close", None)
                 )
                 if callable(stopper):
                     stopper()
+                # TWM.stop() only FLAGS its asyncio loop to wind down (sets
+                # _running=False, closes the client, marks each socket); the
+                # reader thread actually exits a fraction of a second later on
+                # its next loop tick. TWM is a threading.Thread, so a bounded
+                # join() makes teardown SYNCHRONOUS — without it a reconnect
+                # rebuild's fresh manager would briefly overlap the dying one
+                # and double-deliver ticks for ~0.2-0.6s (a transient repeat at
+                # the exact moment we're trying to remove repeats). Bounded so a
+                # wedged reader can't hang the login/​shutdown thread forever.
+                joiner = getattr(bm, "join", None)
+                if callable(joiner):
+                    joiner(timeout=6.0)
             except Exception as exc:                     # pragma: no cover
                 logger.debug(
                     "Binance[%s] ws manager teardown failed: %s",
@@ -1053,19 +1066,23 @@ class DataPlugin(DataPluginV2):
         account`` on a re-login: drop the ENTIRE live websocket so the feed
         restarts from a clean slate.
 
-        python-binance's ``ThreadedWebsocketManager`` runs its own internal
-        auto-reconnect. A SOCKS/network blip can leave a stale reader alive
-        that keeps streaming a DUPLICATE copy of every 24h-ticker frame into
-        the same ``BarBuilder`` — two unsynchronised streams whose differing
-        event-times defeat the builder's immediate-previous dedup, so the
-        in-progress bar's close (and the crosshair label's time) oscillate
-        "bar → tick → same bar → realtime → repeat". A plain re-subscribe
-        can't fix it: ``subscribe_realtime`` reuses ``self._bm`` and skips
-        every ``(symbol, venue)`` already in ``_conn_keys``, so it never
-        replaces the stale manager. Stopping the whole manager via
-        :meth:`_teardown_ws` joins those threads and clears the per-socket
-        bookkeeping; the caller re-subscribes immediately after, rebuilding
-        exactly one fresh socket per ``(symbol, venue)``."""
+        Why a full teardown rather than a re-subscribe: ``subscribe_realtime``
+        reuses ``self._bm`` and skips every ``(symbol, venue)`` already in
+        ``_conn_keys``, so a plain re-login never replaces a stale manager — a
+        SOCKS/network blip that left the prior session's
+        ``ThreadedWebsocketManager`` (or its auto-reconnect) in a bad/duplicate
+        state would keep feeding the same ``BarBuilder``, oscillating the live
+        bar "bar → tick → same bar → realtime → repeat" (in-memory only — a
+        chart reload from the clean DB clears it). :meth:`_teardown_ws` stops
+        the manager and BOUNDED-joins its reader thread (TWM.stop() only flags
+        the asyncio loop; the join makes the teardown synchronous so the fresh
+        manager the caller builds next can't briefly overlap the dying one) and
+        clears the per-socket bookkeeping. The caller re-subscribes immediately
+        after, rebuilding exactly one fresh socket per ``(symbol, venue)``.
+
+        The host serializes this with concurrent subscribe/unsubscribe on the
+        same account (RealtimeManager per-account WS-op lock), so the teardown
+        can't race a watchlist-add or a second login pipeline."""
         self._teardown_ws()
 
     def _on_ticker_message(self, msg: dict, exchange: str = "BINANCE") -> None:

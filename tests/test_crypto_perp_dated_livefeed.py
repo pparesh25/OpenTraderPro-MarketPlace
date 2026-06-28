@@ -122,6 +122,7 @@ class _RecordingWS:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.stopped = False
+        self.joined_timeout = None
 
     def start(self) -> None:
         pass
@@ -137,9 +138,14 @@ class _RecordingWS:
         return f"fut:{symbol}"
 
     def stop(self) -> None:
-        # TWM.stop() joins the reader threads + closes the event loop; a
-        # zombie auto-reconnect reader dies with it.
+        # TWM.stop() only FLAGS its asyncio loop to wind down; the reader
+        # thread exits a moment later. _teardown_ws bounded-joins it next.
         self.stopped = True
+
+    def join(self, timeout=None) -> None:
+        # TWM is a threading.Thread; _teardown_ws bounded-joins it so the
+        # teardown is synchronous and the rebuilt manager can't overlap it.
+        self.joined_timeout = timeout
 
 
 class _WsSession:
@@ -291,6 +297,7 @@ class TestResetRealtime:
         p.reset_realtime()
 
         assert ws.stopped is True                      # whole manager stopped
+        assert ws.joined_timeout == 6.0                # bounded-joined the reader
         assert p._bm is None                           # no stale reuse next time
         assert p._conn_keys == {}                       # per-socket keys cleared
         assert p._last_cum_volume == {}                 # volume baselines cleared
