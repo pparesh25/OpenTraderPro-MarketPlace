@@ -156,7 +156,18 @@ TIMEFRAME_MAP: dict[str, str] = {
 SPOT = "CRYPTO_SPOT"
 USDM = "USDM_FUTURES"
 COINM = "COINM_FUTURES"
+OPTIONS = "CRYPTO_OPTIONS"     # Binance EAPI European options (data-side only)
+# Exec trades spot + futures only — options ORDER placement is not implemented,
+# so OPTIONS is deliberately ABSENT from SUPPORTED_SEGMENTS (→ CAPABILITIES
+# .segments) to avoid advertising an options order route that does not exist.
 SUPPORTED_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM)
+
+# Shared-session exchange-info scope — MUST stay identical to the matching
+# constant in crypto_exchange_data.txt. The single per-alias ``BinanceSession``
+# is created by whichever plugin half loads first; the data half dumps options
+# through whatever shared instance exists, so this file's session must be able
+# to load the OPTIONS exchangeInfo even though THIS half never trades them.
+_SESSION_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM, OPTIONS)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -186,10 +197,10 @@ class BinanceSession:
 
         # Per-segment exchange-info caches ({"BTCUSDT": {…filters…}, …}).
         self._symbol_cache: dict[str, dict[str, dict]] = {
-            SPOT: {}, USDM: {}, COINM: {},
+            SPOT: {}, USDM: {}, COINM: {}, OPTIONS: {},
         }
         self._last_symbol_update: dict[str, float] = {
-            SPOT: 0.0, USDM: 0.0, COINM: 0.0,
+            SPOT: 0.0, USDM: 0.0, COINM: 0.0, OPTIONS: 0.0,
         }
 
         # Serialise concurrent REST calls — python-binance's ``Client``
@@ -304,7 +315,7 @@ class BinanceSession:
     # ── Exchange info cache ──────────────────────────────────────────
     def load_symbols(self, segment: str = SPOT, force: bool = False) -> None:
         """Fetch and cache exchange info for ``segment`` (1 h TTL)."""
-        if self._client is None or segment not in SUPPORTED_SEGMENTS:
+        if self._client is None or segment not in _SESSION_SEGMENTS:
             return
         if (
             not force
@@ -314,15 +325,23 @@ class BinanceSession:
             return
 
         fetcher = {
-            SPOT:  "get_exchange_info",
-            USDM:  "futures_exchange_info",
-            COINM: "futures_coin_exchange_info",
+            SPOT:    "get_exchange_info",
+            USDM:    "futures_exchange_info",
+            COINM:   "futures_coin_exchange_info",
+            OPTIONS: "options_exchange_info",
         }[segment]
         try:
             with self.api_lock:
                 info = getattr(self._client, fetcher)()
+            # Spot / futures exchangeInfo lists rows under ``"symbols"``; the
+            # EAPI options exchangeInfo lists them under ``"optionSymbols"``.
+            rows = (
+                info.get("optionSymbols")
+                if segment == OPTIONS
+                else info.get("symbols")
+            )
             cache: dict[str, dict] = {}
-            for sym in info.get("symbols", []):
+            for sym in (rows or []):
                 cache[sym["symbol"].upper()] = sym
             self._symbol_cache[segment] = cache
             self._last_symbol_update[segment] = time.time()
@@ -468,7 +487,7 @@ class BinanceSession:
         self._client = None
         self._configured = False
         self._authenticated = False
-        for seg in SUPPORTED_SEGMENTS:
+        for seg in _SESSION_SEGMENTS:
             self._symbol_cache[seg].clear()
             self._last_symbol_update[seg] = 0.0
 

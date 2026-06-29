@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 
 def _crypto_segment_metadata() -> dict:
-    """Pretty labels + ordering for the three Binance segments this plugin
+    """Pretty labels + ordering for the Binance segments this plugin
     dumps into symbol_master. Presentation-only — perp-vs-dated and the
     quote-asset pair facet are DERIVED by the app from the typed rows
     (instrument_type / quote_asset), not declared here. ``{}`` on an older app."""
@@ -73,6 +73,7 @@ def _crypto_segment_metadata() -> dict:
         SPOT: sm(display_name="Spot", group="BINANCE", order=1),
         USDM: sm(display_name="USD-M Futures", group="BINANCE", order=2),
         COINM: sm(display_name="COIN-M Futures", group="BINANCE", order=3),
+        OPTIONS: sm(display_name="European Options", group="BINANCE", order=4),
     }
 
 
@@ -96,6 +97,8 @@ def _build_crypto_capabilities() -> Capabilities:
             "CRYPTO": SPOT,
             "BINANCE_USDM": USDM,
             "BINANCE_COINM": COINM,
+            "BINANCE_OPTIONS": OPTIONS,
+            "BINANCE_EAPI": OPTIONS,
         }),
     )
     meta = _crypto_segment_metadata()
@@ -174,7 +177,18 @@ TIMEFRAME_MAP: dict[str, str] = {
 SPOT = "CRYPTO_SPOT"
 USDM = "USDM_FUTURES"
 COINM = "COINM_FUTURES"
-SUPPORTED_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM)
+OPTIONS = "CRYPTO_OPTIONS"     # Binance EAPI European options (BTC/ETH/…)
+SUPPORTED_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM, OPTIONS)
+
+# Segments the SHARED ``BinanceSession`` can fetch exchange-info / cache for.
+# A single session per alias is created by whichever plugin half (this data
+# file or crypto_exchange_exec.txt) loads first, so BOTH copies must be able
+# to load every segment EITHER half needs. The data side dumps options but the
+# exec side may own the shared instance — hence OPTIONS lives here even though
+# the exec file deliberately keeps it OUT of its ``SUPPORTED_SEGMENTS`` (no
+# options order route). Kept identical in the exec file so the byte-identical
+# session behaves the same regardless of which factory won the construct race.
+_SESSION_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM, OPTIONS)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -204,10 +218,10 @@ class BinanceSession:
 
         # Per-segment exchange-info caches ({"BTCUSDT": {…filters…}, …}).
         self._symbol_cache: dict[str, dict[str, dict]] = {
-            SPOT: {}, USDM: {}, COINM: {},
+            SPOT: {}, USDM: {}, COINM: {}, OPTIONS: {},
         }
         self._last_symbol_update: dict[str, float] = {
-            SPOT: 0.0, USDM: 0.0, COINM: 0.0,
+            SPOT: 0.0, USDM: 0.0, COINM: 0.0, OPTIONS: 0.0,
         }
 
         # Serialise concurrent REST calls — python-binance's ``Client``
@@ -350,7 +364,7 @@ class BinanceSession:
     # ── Exchange info cache ──────────────────────────────────────────
     def load_symbols(self, segment: str = SPOT, force: bool = False) -> None:
         """Fetch and cache exchange info for ``segment`` (1 h TTL)."""
-        if self._client is None or segment not in SUPPORTED_SEGMENTS:
+        if self._client is None or segment not in _SESSION_SEGMENTS:
             return
         if (
             not force
@@ -360,15 +374,23 @@ class BinanceSession:
             return
 
         fetcher = {
-            SPOT:  "get_exchange_info",
-            USDM:  "futures_exchange_info",
-            COINM: "futures_coin_exchange_info",
+            SPOT:    "get_exchange_info",
+            USDM:    "futures_exchange_info",
+            COINM:   "futures_coin_exchange_info",
+            OPTIONS: "options_exchange_info",
         }[segment]
         try:
             with self.api_lock:
                 info = getattr(self._client, fetcher)()
+            # Spot / futures exchangeInfo lists rows under ``"symbols"``; the
+            # EAPI options exchangeInfo lists them under ``"optionSymbols"``.
+            rows = (
+                info.get("optionSymbols")
+                if segment == OPTIONS
+                else info.get("symbols")
+            )
             cache: dict[str, dict] = {}
-            for sym in info.get("symbols", []):
+            for sym in (rows or []):
                 cache[sym["symbol"].upper()] = sym
             self._symbol_cache[segment] = cache
             self._last_symbol_update[segment] = time.time()
@@ -552,7 +574,7 @@ class BinanceSession:
         self._client = None
         self._configured = False
         self._authenticated = False
-        for seg in SUPPORTED_SEGMENTS:
+        for seg in _SESSION_SEGMENTS:
             self._symbol_cache[seg].clear()
             self._last_symbol_update[seg] = 0.0
 
@@ -836,7 +858,11 @@ class DataPlugin(DataPluginV2):
         :class:`SymbolRecord`. USDM / COINM rows carry the contract type
         (perpetual → ``CRYPTO_PERP`` vs dated future → ``CRYPTO_FUTURE`` with
         its delivery expiry) + the base-asset underlying so the app can group
-        a futures board; SPOT rows are plain ``CRYPTO_SPOT``.
+        a futures board; SPOT rows are plain ``CRYPTO_SPOT``. OPTIONS (EAPI)
+        rows map to the generic ``OPTION`` type carrying expiry + strike +
+        CE/PE leg + the spot ``underlying`` they settle against, so the app's
+        data-driven option-chain builder lights up exactly as it does for an
+        NSE/MCX chain.
         """
         if not self._session.is_authenticated:
             raise RuntimeError("Not authenticated.")
@@ -850,10 +876,31 @@ class DataPlugin(DataPluginV2):
             base = str(info.get("baseAsset", ""))
             quote = str(info.get("quoteAsset", ""))
             step, min_qty = _lot_filter_of(info)
+            strike: float | None = None
+            option_type: str | None = None
+            display_name = f"{base}/{quote}" if (base or quote) else sym
             if seg == SPOT:
                 itype = InstrumentType.CRYPTO_SPOT
                 expiry: date | None = None
                 underlying: str | None = None
+            elif seg == OPTIONS:
+                # Binance EAPI (European) options: each row owns its expiry,
+                # strike and CALL/PUT side plus the spot ``underlying`` it
+                # settles against (e.g. BTC-260925-145000-C → BTCUSDT). Reuse
+                # the generic ``OPTION`` type (there is no CRYPTO_OPTION) so the
+                # app's option-chain builder routes it down the same data-driven
+                # path as NSE/MCX. The chain groups legs as CE/PE, and Binance
+                # options ARE European-style, so CALL→CE / PUT→PE is exact —
+                # not a relabel hack (CE = Call European, PE = Put European).
+                itype = InstrumentType.OPTION
+                expiry = _coerce_delivery(info.get("expiryDate"))
+                underlying = str(info.get("underlying", "")) or None
+                strike = _safe_float_or_none(info.get("strikePrice"))
+                option_type = (
+                    "CE" if str(info.get("side", "")).upper() == "CALL"
+                    else "PE"
+                )
+                display_name = sym
             else:
                 # Perp vs dated is decided by whether a REAL delivery date
                 # exists — NOT by the ``contractType`` string. Binance ships
@@ -876,13 +923,15 @@ class DataPlugin(DataPluginV2):
                 exchange=seg,
                 segment=seg,
                 instrument_type=itype,
-                display_name=f"{base}/{quote}" if (base or quote) else sym,
+                display_name=display_name,
                 tick_size=_tick_size_of(info),
                 step_size=step,
                 min_quantity=min_qty,
                 quote_asset=quote or None,
                 expiry=expiry,
                 underlying_symbol=underlying,
+                strike=strike,
+                option_type=option_type,
             ))
         return records
 
@@ -1230,6 +1279,7 @@ def _resolve_segment(exchange: str) -> str:
     * ``"BINANCE_SPOT"`` / ``"SPOT"`` → SPOT
     * ``"USDM"`` / ``"USD-M"``       → USDM_FUTURES
     * ``"COINM"`` / ``"COIN-M"``     → COINM_FUTURES
+    * ``"OPTIONS"`` / ``"EAPI"``     → CRYPTO_OPTIONS
     * anything else                 → SPOT
     """
     if not exchange:
@@ -1241,6 +1291,9 @@ def _resolve_segment(exchange: str) -> str:
         return USDM
     if e in (COINM, "COINM", "COINM_FUTURES", "COIN_M", "COIN_M_FUTURES"):
         return COINM
+    if e in (OPTIONS, "OPTIONS", "CRYPTO_OPTIONS", "EAPI",
+             "BINANCE_OPTIONS", "BINANCE_EAPI"):
+        return OPTIONS
     return SPOT
 
 

@@ -45,6 +45,22 @@ def _fut_info(symbol: str, base: str, quote: str, ctype: str, delivery_ms: int) 
     }
 
 
+def _opt_info(
+    symbol: str, underlying: str, side: str, strike: float, expiry_ms: int,
+    *, tick: str = "0.1", step: str = "0.01", quote: str = "USDT",
+) -> dict:
+    """A minimal Binance EAPI options exchangeInfo (``optionSymbols``) row."""
+    return {
+        "symbol": symbol, "underlying": underlying, "quoteAsset": quote,
+        "side": side, "strikePrice": str(strike), "expiryDate": expiry_ms,
+        "unit": 1, "status": "TRADING",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": tick},
+            {"filterType": "LOT_SIZE", "stepSize": step, "minQty": step},
+        ],
+    }
+
+
 class _FakeSession:
     """Canned exchange-info, authenticated. ``rows_by_seg`` =
     ``{segment: {SYMBOL: exchangeInfo_dict}}``."""
@@ -115,6 +131,58 @@ class TestPerpDatedClassification:
             for r in p.fetch_instruments(seg):
                 if r.instrument_type is InstrumentType.CRYPTO_FUTURE:
                     assert r.expiry is not None, f"{r.symbol}: dated future with NULL expiry"
+
+
+# ── Q2: Binance EAPI options instrument dump ──────────────────────────────────
+class TestOptionsClassification:
+    def test_options_segment_supported_and_resolves(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        assert OPTIONS == "CRYPTO_OPTIONS"
+        assert OPTIONS in ns["SUPPORTED_SEGMENTS"]
+        # The shared session must be able to load options exchange-info.
+        assert OPTIONS in ns["_SESSION_SEGMENTS"]
+        resolve = ns["_resolve_segment"]
+        for alias in ("CRYPTO_OPTIONS", "OPTIONS", "EAPI",
+                      "BINANCE_OPTIONS", "BINANCE_EAPI"):
+            assert resolve(alias) == OPTIONS
+
+    def test_eapi_options_map_to_option_ce_pe_strike_expiry(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        p = _make_plugin(ns, _FakeSession({OPTIONS: {
+            "BTC-260925-145000-C": _opt_info(
+                "BTC-260925-145000-C", "BTCUSDT", "CALL", 145000, _ms(2026, 9, 25)),
+            "BTC-260925-145000-P": _opt_info(
+                "BTC-260925-145000-P", "BTCUSDT", "PUT", 145000, _ms(2026, 9, 25)),
+            "ETH-260925-4000-C": _opt_info(
+                "ETH-260925-4000-C", "ETHUSDT", "CALL", 4000, _ms(2026, 9, 25)),
+        }}))
+        recs = {r.symbol: r for r in p.fetch_instruments(OPTIONS)}
+
+        call = recs["BTC-260925-145000-C"]
+        # Reuse the generic OPTION type so the app's chain builder lights up.
+        assert call.instrument_type is InstrumentType.OPTION
+        # Binance options are European → CALL maps to CE (Call European).
+        assert call.option_type == "CE"
+        assert call.strike == 145000.0
+        assert call.expiry is not None
+        # The spot pair the option settles against drives the chain underlying.
+        assert call.underlying_symbol == "BTCUSDT"
+        assert recs["BTC-260925-145000-P"].option_type == "PE"
+        assert recs["ETH-260925-4000-C"].underlying_symbol == "ETHUSDT"
+
+    def test_options_carry_tick_and_lot_from_filters(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        p = _make_plugin(ns, _FakeSession({OPTIONS: {
+            "BTC-260925-145000-C": _opt_info(
+                "BTC-260925-145000-C", "BTCUSDT", "CALL", 145000,
+                _ms(2026, 9, 25), tick="0.5", step="0.01"),
+        }}))
+        r = p.fetch_instruments(OPTIONS)[0]
+        assert r.tick_size == 0.5
+        assert r.step_size == 0.01
 
 
 # ── F5: live-ticker socket routing (spot vs USD-M vs COIN-M) ──────────────────
