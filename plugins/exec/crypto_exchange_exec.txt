@@ -1508,6 +1508,12 @@ class ExecPlugin(ExecPluginV2):
             # set (V3 §F-S1-10 dedup); these strings are unique today.
             "BINANCE_USDM": USDM,
             "BINANCE_COINM": COINM,
+            # Kept in lockstep with the data half's map (V3 §F-S1-10 — both
+            # halves MUST advertise the same exchange_to_segment). These only
+            # NAME the options segment for the shared resolver; exec never
+            # order-routes OPTIONS (it is absent from SUPPORTED_SEGMENTS).
+            "BINANCE_OPTIONS": OPTIONS,
+            "BINANCE_EAPI": OPTIONS,
         }),
     )
 

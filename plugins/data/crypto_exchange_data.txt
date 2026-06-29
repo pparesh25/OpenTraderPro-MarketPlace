@@ -1046,10 +1046,11 @@ class DataPlugin(DataPluginV2):
         (very old python-binance) so the feed degrades rather than breaks.
 
         EAPI options use the ``<symbol>@optionTicker`` 24h stream
-        (``start_options_ticker_socket``): last + day OHLC like spot, but the
-        24h volume arrives under ``V`` (lowercase ``v`` is VEGA there) and
-        bid/ask under ``bo``/``ao`` (``b``/``a`` are bid/ask IV) — so
-        ``_on_ticker_message`` remaps those keys for the options venue.
+        (``start_options_ticker_socket``): live-captured, it delivers a
+        SPOT-shaped slim payload (``c``/``o``/``h``/``l`` + 24h volume under
+        ``v``, no bid/ask, no ``x``) — NOT the rich ``V``/greeks schema the
+        published docs list — so ``_on_ticker_message`` handles it on the same
+        path as spot, deriving prev-close from ``c`` − ``p`` like futures.
 
         F-S2-bin-multivenue — the callback is bound to ``exchange`` so this
         socket's ticks carry the venue they were subscribed under, even when the
@@ -1187,19 +1188,16 @@ class DataPlugin(DataPluginV2):
             return
 
         symbol = str(msg["s"])
-        # EAPI options (@optionTicker) rename two fields vs the spot/futures
-        # @ticker: 24h volume is "V" (lowercase "v" is VEGA), and bid/ask are
-        # "bo"/"ao" ("b"/"a" are bid/ask IV). Pick the right keys per venue so
-        # the options feed reports real volume + book, not greeks.
-        is_opt = _resolve_segment(exchange) == OPTIONS
-        vol_key = "V" if is_opt else "v"
-        bid_key, ask_key = ("bo", "ao") if is_opt else ("b", "a")
-        # Binance volume is cumulative 24h — per-tick delta helps OHLCV
-        # bar-builders reconstruct real per-tick volume. Keyed by
+        # Binance "v" is cumulative 24h base volume — per-tick delta helps
+        # OHLCV bar-builders reconstruct real per-tick volume. Keyed by
         # (symbol, exchange) so the same symbol on two venues keeps separate
-        # cumulative baselines (F-S2-bin-multivenue).
+        # cumulative baselines (F-S2-bin-multivenue). NOTE: the EAPI options
+        # @optionTicker stream delivers a SPOT-shaped slim payload (live-
+        # captured: ``c``/``o``/``h``/``l`` + volume under ``v``, no bid/ask,
+        # no ``x``) — NOT the rich "V"/greeks schema the published docs list —
+        # so options need NO field remap and flow through this same path.
         vkey = (symbol, exchange)
-        cum_vol = float(msg.get(vol_key, 0.0))
+        cum_vol = float(msg.get("v", 0.0))
         prev = self._last_cum_volume.get(vkey, 0.0)
         delta = max(0, int(cum_vol - prev)) if prev > 0 else 0
         self._last_cum_volume[vkey] = cum_vol
@@ -1251,8 +1249,8 @@ class DataPlugin(DataPluginV2):
                 price=float(msg.get("c", 0.0)),
                 volume=delta,
                 timestamp=ts,
-                bid=float(msg[bid_key]) if msg.get(bid_key) else None,
-                ask=float(msg[ask_key]) if msg.get(ask_key) else None,
+                bid=float(msg["b"]) if msg.get("b") else None,
+                ask=float(msg["a"]) if msg.get("a") else None,
                 day_open=_safe_float_or_none(msg.get("o")),
                 day_high=_safe_float_or_none(msg.get("h")),
                 day_low=_safe_float_or_none(msg.get("l")),

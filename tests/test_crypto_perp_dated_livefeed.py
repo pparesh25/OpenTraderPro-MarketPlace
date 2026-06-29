@@ -306,9 +306,10 @@ class TestLiveSocketRouting:
         # futures socket (which would 400 on an option symbol).
         assert kind_by_sym["btc-260925-145000-c"] == "options"
 
-    def test_options_payload_remaps_volume_bid_ask_and_prev_close(self):
-        # The @optionTicker payload renames fields vs spot: V=volume (v=vega),
-        # bo/ao=bid/ask (b/a=IV), and carries no x (prev close) — derived c-p.
+    def test_options_payload_reads_spot_shaped_optionticker(self):
+        # Live-captured, the @optionTicker stream is SPOT-shaped (slim): volume
+        # under "v" (NOT the docs' "V"/vega), no bid/ask, and no "x" so
+        # prev_close derives c - p. Options thus need no field remap.
         ns = _load_ns()
         p = self._plugin(ns, _RecordingWS())
         ticks: list = []
@@ -318,22 +319,20 @@ class TestLiveSocketRouting:
             return {
                 "e": "24hrTicker", "E": etime, "s": "BTC-260925-145000-C",
                 "o": "10", "h": "30", "l": "5", "c": "25",
-                "V": vol,           # 24h volume (contracts)
+                "v": vol,           # 24h volume (contracts) — lowercase, like spot
                 "p": "5",           # price change → prev_close = 25 - 5 = 20
-                "bo": "22", "ao": "28",   # bid / ask PRICE
-                "b": "0.59", "a": "0.87", # bid / ask IV — must be ignored
-                "v": "2.01",              # vega — must NOT be read as volume
+                # no x, no b/a, no bo/ao — the slim stream omits them.
             }
         # First tick seeds the cumulative-volume baseline (delta 0); the second
-        # produces the per-tick delta from the REAL volume field ("V": 7 → 10).
+        # produces the per-tick delta from the REAL volume field ("v": 7 → 10).
         p._on_ticker_message(opt_tick("7", 1), "CRYPTO_OPTIONS")
         p._on_ticker_message(opt_tick("10", 2), "CRYPTO_OPTIONS")
         t = ticks[-1]
         assert t.price == 25.0                  # last "c"
-        assert t.bid == 22.0 and t.ask == 28.0  # bo/ao, not the IV b/a
-        assert t.prev_close == 20.0             # derived c - p
+        assert t.bid is None and t.ask is None  # stream carries no book
+        assert t.prev_close == 20.0             # derived c - p (no "x")
         assert t.day_open == 10.0 and t.day_high == 30.0 and t.day_low == 5.0
-        assert t.volume == 3                    # ΔV (7→10), not vega 2.01
+        assert t.volume == 3                    # Δv (7→10) — real volume, not 0
         assert t.exchange == "CRYPTO_OPTIONS"
 
     def test_falls_back_to_spot_and_warns_when_futurestype_missing(self, caplog):
