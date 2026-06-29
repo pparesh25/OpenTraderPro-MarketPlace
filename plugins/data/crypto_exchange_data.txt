@@ -1045,6 +1045,12 @@ class DataPlugin(DataPluginV2):
         there. Falls back to the spot socket when ``FuturesType`` is unavailable
         (very old python-binance) so the feed degrades rather than breaks.
 
+        EAPI options use the ``<symbol>@optionTicker`` 24h stream
+        (``start_options_ticker_socket``): last + day OHLC like spot, but the
+        24h volume arrives under ``V`` (lowercase ``v`` is VEGA there) and
+        bid/ask under ``bo``/``ao`` (``b``/``a`` are bid/ask IV) — so
+        ``_on_ticker_message`` remaps those keys for the options venue.
+
         F-S2-bin-multivenue — the callback is bound to ``exchange`` so this
         socket's ticks carry the venue they were subscribed under, even when the
         SAME symbol also streams on another venue (e.g. BTCUSDT spot + USD-M)."""
@@ -1056,6 +1062,11 @@ class DataPlugin(DataPluginV2):
                 callback=cb,
                 symbol=symbol_lower,
                 futures_type=ftype,
+            )
+        if seg == OPTIONS:
+            return self._bm.start_options_ticker_socket(
+                callback=cb,
+                symbol=symbol_lower,
             )
         return self._bm.start_symbol_ticker_socket(
             callback=cb,
@@ -1176,12 +1187,19 @@ class DataPlugin(DataPluginV2):
             return
 
         symbol = str(msg["s"])
-        # Binance "v" is cumulative 24h base volume — per-tick delta helps
-        # OHLCV bar-builders reconstruct real per-tick volume. Keyed by
+        # EAPI options (@optionTicker) rename two fields vs the spot/futures
+        # @ticker: 24h volume is "V" (lowercase "v" is VEGA), and bid/ask are
+        # "bo"/"ao" ("b"/"a" are bid/ask IV). Pick the right keys per venue so
+        # the options feed reports real volume + book, not greeks.
+        is_opt = _resolve_segment(exchange) == OPTIONS
+        vol_key = "V" if is_opt else "v"
+        bid_key, ask_key = ("bo", "ao") if is_opt else ("b", "a")
+        # Binance volume is cumulative 24h — per-tick delta helps OHLCV
+        # bar-builders reconstruct real per-tick volume. Keyed by
         # (symbol, exchange) so the same symbol on two venues keeps separate
         # cumulative baselines (F-S2-bin-multivenue).
         vkey = (symbol, exchange)
-        cum_vol = float(msg.get("v", 0.0))
+        cum_vol = float(msg.get(vol_key, 0.0))
         prev = self._last_cum_volume.get(vkey, 0.0)
         delta = max(0, int(cum_vol - prev)) if prev > 0 else 0
         self._last_cum_volume[vkey] = cum_vol
@@ -1233,8 +1251,8 @@ class DataPlugin(DataPluginV2):
                 price=float(msg.get("c", 0.0)),
                 volume=delta,
                 timestamp=ts,
-                bid=float(msg["b"]) if msg.get("b") else None,
-                ask=float(msg["a"]) if msg.get("a") else None,
+                bid=float(msg[bid_key]) if msg.get(bid_key) else None,
+                ask=float(msg[ask_key]) if msg.get(ask_key) else None,
                 day_open=_safe_float_or_none(msg.get("o")),
                 day_high=_safe_float_or_none(msg.get("h")),
                 day_low=_safe_float_or_none(msg.get("l")),

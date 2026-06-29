@@ -205,6 +205,10 @@ class _RecordingWS:
         self.calls.append((str(futures_type), symbol))
         return f"fut:{symbol}"
 
+    def start_options_ticker_socket(self, callback, symbol) -> str:
+        self.calls.append(("options", symbol))
+        return f"opt:{symbol}"
+
     def stop(self) -> None:
         # TWM.stop() only FLAGS its asyncio loop to wind down; the reader
         # thread exits a moment later. _teardown_ws bounded-joins it next.
@@ -288,6 +292,49 @@ class TestLiveSocketRouting:
         p._on_ticker_message(dict(payload), "CRYPTO_SPOT")
         p._on_ticker_message(dict(payload), "USDM_FUTURES")
         assert {t.exchange for t in ticks} == {"CRYPTO_SPOT", "USDM_FUTURES"}
+
+    def test_options_use_the_option_ticker_socket(self):
+        ns = _load_ns()
+        ws = _RecordingWS()
+        p = self._plugin(ns, ws)
+        p.subscribe_realtime(
+            [("BTC-260925-145000-C", "CRYPTO_OPTIONS")],
+            on_tick=lambda _t: None,
+        )
+        kind_by_sym = {sym: kind for kind, sym in ws.calls}
+        # The @optionTicker stream, NOT the spot @ticker (wrong fields) nor a
+        # futures socket (which would 400 on an option symbol).
+        assert kind_by_sym["btc-260925-145000-c"] == "options"
+
+    def test_options_payload_remaps_volume_bid_ask_and_prev_close(self):
+        # The @optionTicker payload renames fields vs spot: V=volume (v=vega),
+        # bo/ao=bid/ask (b/a=IV), and carries no x (prev close) — derived c-p.
+        ns = _load_ns()
+        p = self._plugin(ns, _RecordingWS())
+        ticks: list = []
+        p._on_tick = ticks.append
+
+        def opt_tick(vol, etime):
+            return {
+                "e": "24hrTicker", "E": etime, "s": "BTC-260925-145000-C",
+                "o": "10", "h": "30", "l": "5", "c": "25",
+                "V": vol,           # 24h volume (contracts)
+                "p": "5",           # price change → prev_close = 25 - 5 = 20
+                "bo": "22", "ao": "28",   # bid / ask PRICE
+                "b": "0.59", "a": "0.87", # bid / ask IV — must be ignored
+                "v": "2.01",              # vega — must NOT be read as volume
+            }
+        # First tick seeds the cumulative-volume baseline (delta 0); the second
+        # produces the per-tick delta from the REAL volume field ("V": 7 → 10).
+        p._on_ticker_message(opt_tick("7", 1), "CRYPTO_OPTIONS")
+        p._on_ticker_message(opt_tick("10", 2), "CRYPTO_OPTIONS")
+        t = ticks[-1]
+        assert t.price == 25.0                  # last "c"
+        assert t.bid == 22.0 and t.ask == 28.0  # bo/ao, not the IV b/a
+        assert t.prev_close == 20.0             # derived c - p
+        assert t.day_open == 10.0 and t.day_high == 30.0 and t.day_low == 5.0
+        assert t.volume == 3                    # ΔV (7→10), not vega 2.01
+        assert t.exchange == "CRYPTO_OPTIONS"
 
     def test_falls_back_to_spot_and_warns_when_futurestype_missing(self, caplog):
         import logging
