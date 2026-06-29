@@ -71,3 +71,64 @@ class TestOptionsOrderRefused:
         supported = ns["SUPPORTED_SEGMENTS"]
         for s in ("CRYPTO_SPOT", "USDM_FUTURES", "COINM_FUTURES", "BINANCE"):
             assert resolve(s) in supported
+
+
+class TestOptionSymbolShapeGuard:
+    """EXEC-2 — an EAPI option *symbol* must be refused even when tagged with a
+    TRADABLE segment. The segment guard above fires only for a CRYPTO_OPTIONS
+    segment; a manual SPOT pick in the Quick-Order combo would otherwise pass it
+    and submit a malformed SPOT order that only Binance rejects (-1121). The
+    symbol-shape guard refuses locally (fail-closed)."""
+
+    def test_is_eapi_option_symbol_matches_option_contracts(self):
+        ns = _load_ns()
+        is_opt = ns["_is_eapi_option_symbol"]
+        for s in (
+            "BTC-261225-50000-C", "ETH-251226-2500.5-P",
+            "BTC-260630-60000-C", "BNB-260327-700-P",
+            "DOGE-261225-0.5-C", "1000SHIB-260626-0.01-P",
+            "btc-261225-50000-c",          # lower-case is upper-cased first
+        ):
+            assert is_opt(s) is True, s
+
+    def test_is_eapi_option_symbol_no_false_positives(self):
+        # Spot/USD-M/COIN-M symbols use NO dashes, so they must NOT match —
+        # otherwise the guard would refuse legitimate spot/futures orders.
+        ns = _load_ns()
+        is_opt = ns["_is_eapi_option_symbol"]
+        for s in (
+            "BTCUSDT", "ETHUSDT", "BTCUSDT_261225", "BTCUSD_PERP",
+            "BTCUSD_261225", "ADAUSDT_260327", "",
+            "BTC-USDT", "BTC-261225-50000", "BTC-261225-C",
+        ):
+            assert is_opt(s) is False, s
+
+    def test_place_order_refuses_option_symbol_on_spot_segment(self):
+        # The exploit case: an option symbol with a manually-picked SPOT
+        # segment. SPOT IS in SUPPORTED_SEGMENTS, so the segment guard passes
+        # — the symbol-shape guard must refuse, and must do so BEFORE touching
+        # the client (``_AuthSession.client`` raises if reached).
+        ns = _load_ns()
+        p = _plugin(ns)
+        resp = p.place_order(OrderRequest(
+            account_id=p.account_id, symbol="BTC-260630-60000-C",
+            exchange="CRYPTO_SPOT", segment="CRYPTO_SPOT",
+            side="BUY", order_type="MARKET", quantity=1, product="CNC",
+        ))
+        assert resp.ok is False
+        assert "option" in (resp.error or "").lower()
+
+    def test_place_order_allows_spot_symbol_on_spot_segment(self):
+        # Regression: a real spot symbol on the SPOT segment must NOT be
+        # refused by the symbol-shape guard. It passes both guards and only
+        # then reaches the client — so ``_AuthSession.client`` IS touched,
+        # raising the sentinel AssertionError (proof the guards let it
+        # through rather than refusing early).
+        ns = _load_ns()
+        p = _plugin(ns)
+        with pytest.raises(AssertionError, match="client touched"):
+            p.place_order(OrderRequest(
+                account_id=p.account_id, symbol="BTCUSDT",
+                exchange="CRYPTO_SPOT", segment="CRYPTO_SPOT",
+                side="BUY", order_type="MARKET", quantity=1, product="CNC",
+            ))

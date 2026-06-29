@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -1745,6 +1746,22 @@ class ExecPlugin(ExecPluginV2):
                 ok=False,
                 error=f"crypto_exchange exec does not trade {segment} orders",
             )
+        # EXEC-2 defense-in-depth — refuse EAPI OPTION contract symbols
+        # regardless of the chosen segment. The segment guard above fails
+        # closed only when the segment itself resolves to OPTIONS; it does
+        # NOT catch an option symbol tagged with a tradable segment (a
+        # manual SPOT pick in the Quick-Order combo). Catch it on the symbol
+        # SHAPE so the rejection is local (fail-closed) instead of a
+        # malformed SPOT order bounced by Binance (-1121). Spot/futures
+        # symbols use no dashes and never match.
+        if _is_eapi_option_symbol(request.symbol):
+            return OrderResponse(
+                ok=False,
+                error=(
+                    "crypto_exchange exec does not trade options "
+                    f"({request.symbol!r} is an EAPI option contract)"
+                ),
+            )
         client = self._session.client
         if client is None:
             return OrderResponse(ok=False, error="client unavailable")
@@ -2242,6 +2259,30 @@ def _safe_float(v: object) -> float:
         return float(v)           # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0.0
+
+
+# EXEC-2 — Binance EAPI option contract symbols look like
+# ``BTC-261225-50000-C`` / ``ETH-251226-2500.5-P``
+# (UNDERLYING-YYMMDD-STRIKE-[C|P]). Spot/futures symbols carry NO dashes
+# (``BTCUSDT``, ``BTCUSDT_261225``, ``BTCUSD_PERP``) so they never match —
+# the false-positive guards are pinned in test_crypto_options_exec_guard.
+_EAPI_OPTION_SYMBOL_RE = re.compile(r"^[A-Z0-9]+-\d{6}-\d+(\.\d+)?-[CP]$")
+
+
+def _is_eapi_option_symbol(symbol: str) -> bool:
+    """True when ``symbol`` is a Binance EAPI option contract.
+
+    Defense-in-depth for :meth:`ExecPlugin.place_order`: this exec half
+    trades spot + futures only (OPTIONS is absent from
+    ``SUPPORTED_SEGMENTS``), so an option symbol must be refused no matter
+    which segment the caller picked. The segment guard alone is not enough
+    — the app UI can hand us an option symbol tagged with a *tradable*
+    segment (a manual SPOT pick in the Quick-Order combo), which the
+    segment check would wave through into a malformed SPOT order that only
+    Binance rejects (-1121). Matching on the SYMBOL SHAPE refuses it
+    LOCALLY (fail-closed) instead.
+    """
+    return bool(_EAPI_OPTION_SYMBOL_RE.match((symbol or "").upper()))
 
 
 def _resolve_segment(exchange: str) -> str:
