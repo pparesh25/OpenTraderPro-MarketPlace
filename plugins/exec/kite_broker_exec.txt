@@ -868,7 +868,16 @@ class ExecPlugin(ExecPluginV2):
         ),
     )
     CAPABILITIES: ClassVar[ExecCapabilities] = ExecCapabilities(
-        segments=("NSE_EQ", "BSE_EQ", "NFO", "MCX", "CDS"),
+        # All five derivative exchanges Zerodha order-routes (NFO, BFO, MCX,
+        # CDS, BCD) plus the two cash segments. place_order passes
+        # request.exchange straight through to the Kite API, so every one of
+        # these is genuinely tradable — they MUST all be advertised here.
+        # BFO (BSE F&O — Sensex/Bankex options) and BCD (BSE currency
+        # options) were previously omitted, which made the Quick-Order
+        # instrument-type gate refuse those options even though Zerodha
+        # trades them; the data half + market-window logic already know all
+        # five (see _DERIVATIVE_EXCHANGES in kite_broker_data).
+        segments=("NSE_EQ", "BSE_EQ", "NFO", "BFO", "MCX", "CDS", "BCD"),
         product_types=("CNC", "MIS", "NRML"),
         order_types=("MARKET", "LIMIT", "STOP_LIMIT", "STOP"),
         async_execution_reports=True,
