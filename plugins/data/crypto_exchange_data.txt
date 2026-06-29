@@ -786,6 +786,13 @@ class DataPlugin(DataPluginV2):
                         client, symbol.upper(), interval,
                         int(start_ms), int(end_ms),
                     )
+                elif segment == OPTIONS:
+                    # EAPI has no auto-paginating klines wrapper and caps each
+                    # response — page the raw ``options_klines`` ourselves.
+                    klines = _options_historical_klines(
+                        client, symbol.upper(), interval,
+                        int(start_ms), int(end_ms),
+                    )
                 else:
                     fetcher = {
                         SPOT: "get_historical_klines",
@@ -1337,6 +1344,42 @@ def _coin_m_historical_klines(
     while cursor < end:
         window_end = min(cursor + step * limit, end)
         chunk = client.futures_coin_klines(
+            symbol=symbol, interval=interval,
+            startTime=cursor, endTime=window_end, limit=limit,
+        )
+        if not chunk:
+            break
+        out.extend(chunk)
+        nxt = int(chunk[-1][0]) + step     # next candle after this page's last
+        if nxt <= cursor:                  # no forward progress → stop
+            break
+        cursor = nxt
+    return out
+
+
+def _options_historical_klines(
+    client, symbol: str, interval: str,
+    start_ms: int, end_ms: int, limit: int = 1500,
+) -> list:
+    """Paginated EAPI options historical klines over ``[start_ms, end_ms]``.
+
+    python-binance exposes only the single-shot ``options_klines`` (no
+    auto-paginating ``*_historical_klines`` wrapper), and the eapi endpoint
+    caps a response at ~1000 candles regardless of the requested ``limit`` —
+    so page it ourselves. Unlike dapi (COIN-M), eapi returns candles FORWARD
+    from the window start, so the bounded-window cursor loop (also used for
+    COIN-M, where it is forced by endTime-anchoring) advances correctly here
+    too: request ``cursor → cursor + step*limit`` windows and step one candle
+    past each page's last open. A freshly-listed option whose data begins
+    after ``cursor`` just returns from its listing forward — collected fine.
+    """
+    step = _interval_ms(interval)
+    out: list = []
+    cursor = int(start_ms)
+    end = int(end_ms)
+    while cursor < end:
+        window_end = min(cursor + step * limit, end)
+        chunk = client.options_klines(
             symbol=symbol, interval=interval,
             startTime=cursor, endTime=window_end, limit=limit,
         )

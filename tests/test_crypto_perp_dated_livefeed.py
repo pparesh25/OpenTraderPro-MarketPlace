@@ -448,3 +448,37 @@ class TestCoinMHistoricalPagination:
         assert len(set(opens)) == 3500          # no duplicate candles across pages
         assert opens == sorted(opens)           # monotonic
         assert len(client.calls) == 3           # paginated, then stopped on short page
+
+
+class _PaginatingOptionsClient:
+    """Fake eapi client: 1m candles forward from start, capped well below the
+    requested ``limit`` (the real eapi caps a response at ~1000 candles)."""
+
+    CAP = 1000
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def options_klines(self, symbol, interval, startTime, endTime, limit):
+        self.calls.append(startTime)
+        t = ((startTime + 59999) // 60000) * 60000      # first minute >= start
+        out = []
+        while t < endTime and len(out) < min(limit, self.CAP):
+            out.append([t, "1", "2", "0", "1", "10"])
+            t += 60000
+        return out
+
+
+class TestOptionsHistoricalPagination:
+    def test_pages_under_the_eapi_cap_without_dupes(self):
+        ns = _load_ns()
+        paginate = ns["_options_historical_klines"]
+        client = _PaginatingOptionsClient()
+        # 2500 one-minute candles, capped at 1000/page → 1000 + 1000 + 500.
+        end = 2500 * 60000
+        bars = paginate(client, "BTC-260925-145000-C", "1m", 0, end, limit=1500)
+        opens = [b[0] for b in bars]
+        assert len(bars) == 2500
+        assert len(set(opens)) == 2500          # no duplicate candles across pages
+        assert opens == sorted(opens)           # monotonic
+        assert len(client.calls) == 3           # advanced by ACTUAL last, not limit
