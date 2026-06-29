@@ -45,6 +45,22 @@ def _fut_info(symbol: str, base: str, quote: str, ctype: str, delivery_ms: int) 
     }
 
 
+def _opt_info(
+    symbol: str, underlying: str, side: str, strike: float, expiry_ms: int,
+    *, tick: str = "0.1", step: str = "0.01", quote: str = "USDT",
+) -> dict:
+    """A minimal Binance EAPI options exchangeInfo (``optionSymbols``) row."""
+    return {
+        "symbol": symbol, "underlying": underlying, "quoteAsset": quote,
+        "side": side, "strikePrice": str(strike), "expiryDate": expiry_ms,
+        "unit": 1, "status": "TRADING",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": tick},
+            {"filterType": "LOT_SIZE", "stepSize": step, "minQty": step},
+        ],
+    }
+
+
 class _FakeSession:
     """Canned exchange-info, authenticated. ``rows_by_seg`` =
     ``{segment: {SYMBOL: exchangeInfo_dict}}``."""
@@ -68,6 +84,7 @@ def _make_plugin(ns: dict, session):
     DataPlugin = ns["DataPlugin"]
     p = object.__new__(DataPlugin)        # skip __init__ (session registry / net)
     p._session = session
+    p.alias = "test"                      # used by log lines (e.g. skip warnings)
     return p
 
 
@@ -117,6 +134,72 @@ class TestPerpDatedClassification:
                     assert r.expiry is not None, f"{r.symbol}: dated future with NULL expiry"
 
 
+# ── Q2: Binance EAPI options instrument dump ──────────────────────────────────
+class TestOptionsClassification:
+    def test_options_segment_supported_and_resolves(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        assert OPTIONS == "CRYPTO_OPTIONS"
+        assert OPTIONS in ns["SUPPORTED_SEGMENTS"]
+        # The shared session must be able to load options exchange-info.
+        assert OPTIONS in ns["_SESSION_SEGMENTS"]
+        resolve = ns["_resolve_segment"]
+        for alias in ("CRYPTO_OPTIONS", "OPTIONS", "EAPI",
+                      "BINANCE_OPTIONS", "BINANCE_EAPI"):
+            assert resolve(alias) == OPTIONS
+
+    def test_eapi_options_map_to_option_ce_pe_strike_expiry(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        p = _make_plugin(ns, _FakeSession({OPTIONS: {
+            "BTC-260925-145000-C": _opt_info(
+                "BTC-260925-145000-C", "BTCUSDT", "CALL", 145000, _ms(2026, 9, 25)),
+            "BTC-260925-145000-P": _opt_info(
+                "BTC-260925-145000-P", "BTCUSDT", "PUT", 145000, _ms(2026, 9, 25)),
+            "ETH-260925-4000-C": _opt_info(
+                "ETH-260925-4000-C", "ETHUSDT", "CALL", 4000, _ms(2026, 9, 25)),
+        }}))
+        recs = {r.symbol: r for r in p.fetch_instruments(OPTIONS)}
+
+        call = recs["BTC-260925-145000-C"]
+        # Reuse the generic OPTION type so the app's chain builder lights up.
+        assert call.instrument_type is InstrumentType.OPTION
+        # Binance options are European → CALL maps to CE (Call European).
+        assert call.option_type == "CE"
+        assert call.strike == 145000.0
+        assert call.expiry is not None
+        # The spot pair the option settles against drives the chain underlying.
+        assert call.underlying_symbol == "BTCUSDT"
+        assert recs["BTC-260925-145000-P"].option_type == "PE"
+        assert recs["ETH-260925-4000-C"].underlying_symbol == "ETHUSDT"
+
+    def test_unknown_option_side_is_skipped_not_mislabeled(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        p = _make_plugin(ns, _FakeSession({OPTIONS: {
+            "BTC-260925-145000-C": _opt_info(
+                "BTC-260925-145000-C", "BTCUSDT", "CALL", 145000, _ms(2026, 9, 25)),
+            # A side Binance never sends today — must be DROPPED, not labeled PE.
+            "BTC-260925-145000-X": _opt_info(
+                "BTC-260925-145000-X", "BTCUSDT", "WEIRD", 145000, _ms(2026, 9, 25)),
+        }}))
+        recs = {r.symbol: r for r in p.fetch_instruments(OPTIONS)}
+        assert recs["BTC-260925-145000-C"].option_type == "CE"
+        assert "BTC-260925-145000-X" not in recs
+
+    def test_options_carry_tick_and_lot_from_filters(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        p = _make_plugin(ns, _FakeSession({OPTIONS: {
+            "BTC-260925-145000-C": _opt_info(
+                "BTC-260925-145000-C", "BTCUSDT", "CALL", 145000,
+                _ms(2026, 9, 25), tick="0.5", step="0.01"),
+        }}))
+        r = p.fetch_instruments(OPTIONS)[0]
+        assert r.tick_size == 0.5
+        assert r.step_size == 0.01
+
+
 # ── F5: live-ticker socket routing (spot vs USD-M vs COIN-M) ──────────────────
 class _RecordingWS:
     def __init__(self) -> None:
@@ -136,6 +219,10 @@ class _RecordingWS:
     ) -> str:
         self.calls.append((str(futures_type), symbol))
         return f"fut:{symbol}"
+
+    def start_options_ticker_socket(self, callback, symbol) -> str:
+        self.calls.append(("options", symbol))
+        return f"opt:{symbol}"
 
     def stop(self) -> None:
         # TWM.stop() only FLAGS its asyncio loop to wind down; the reader
@@ -220,6 +307,48 @@ class TestLiveSocketRouting:
         p._on_ticker_message(dict(payload), "CRYPTO_SPOT")
         p._on_ticker_message(dict(payload), "USDM_FUTURES")
         assert {t.exchange for t in ticks} == {"CRYPTO_SPOT", "USDM_FUTURES"}
+
+    def test_options_use_the_option_ticker_socket(self):
+        ns = _load_ns()
+        ws = _RecordingWS()
+        p = self._plugin(ns, ws)
+        p.subscribe_realtime(
+            [("BTC-260925-145000-C", "CRYPTO_OPTIONS")],
+            on_tick=lambda _t: None,
+        )
+        kind_by_sym = {sym: kind for kind, sym in ws.calls}
+        # The @optionTicker stream, NOT the spot @ticker (wrong fields) nor a
+        # futures socket (which would 400 on an option symbol).
+        assert kind_by_sym["btc-260925-145000-c"] == "options"
+
+    def test_options_payload_reads_spot_shaped_optionticker(self):
+        # Live-captured, the @optionTicker stream is SPOT-shaped (slim): volume
+        # under "v" (NOT the docs' "V"/vega), no bid/ask, and no "x" so
+        # prev_close derives c - p. Options thus need no field remap.
+        ns = _load_ns()
+        p = self._plugin(ns, _RecordingWS())
+        ticks: list = []
+        p._on_tick = ticks.append
+
+        def opt_tick(vol, etime):
+            return {
+                "e": "24hrTicker", "E": etime, "s": "BTC-260925-145000-C",
+                "o": "10", "h": "30", "l": "5", "c": "25",
+                "v": vol,           # 24h volume (contracts) — lowercase, like spot
+                "p": "5",           # price change → prev_close = 25 - 5 = 20
+                # no x, no b/a, no bo/ao — the slim stream omits them.
+            }
+        # First tick seeds the cumulative-volume baseline (delta 0); the second
+        # produces the per-tick delta from the REAL volume field ("v": 7 → 10).
+        p._on_ticker_message(opt_tick("7", 1), "CRYPTO_OPTIONS")
+        p._on_ticker_message(opt_tick("10", 2), "CRYPTO_OPTIONS")
+        t = ticks[-1]
+        assert t.price == 25.0                  # last "c"
+        assert t.bid is None and t.ask is None  # stream carries no book
+        assert t.prev_close == 20.0             # derived c - p (no "x")
+        assert t.day_open == 10.0 and t.day_high == 30.0 and t.day_low == 5.0
+        assert t.volume == 3                    # Δv (7→10) — real volume, not 0
+        assert t.exchange == "CRYPTO_OPTIONS"
 
     def test_falls_back_to_spot_and_warns_when_futurestype_missing(self, caplog):
         import logging
@@ -380,3 +509,40 @@ class TestCoinMHistoricalPagination:
         assert len(set(opens)) == 3500          # no duplicate candles across pages
         assert opens == sorted(opens)           # monotonic
         assert len(client.calls) == 3           # paginated, then stopped on short page
+
+
+class _PaginatingOptionsClient:
+    """Fake eapi client: 1m candles forward from start, capped well below the
+    requested ``limit`` (the real eapi caps a response at ~1000 candles)."""
+
+    CAP = 1000
+
+    def __init__(self) -> None:
+        self.calls: list[int] = []
+
+    def options_klines(self, symbol, interval, startTime, endTime, limit):
+        self.calls.append(startTime)
+        t = ((startTime + 59999) // 60000) * 60000      # first minute >= start
+        out = []
+        while t < endTime and len(out) < min(limit, self.CAP):
+            out.append([t, "1", "2", "0", "1", "10"])
+            t += 60000
+        return out
+
+
+class TestOptionsHistoricalPagination:
+    def test_pages_under_the_eapi_cap_without_dupes(self):
+        ns = _load_ns()
+        paginate = ns["_options_historical_klines"]
+        client = _PaginatingOptionsClient()
+        # 2500 one-minute candles, capped at 1000/page → 1000 + 1000 + 500.
+        end = 2500 * 60000
+        bars = paginate(client, "BTC-260925-145000-C", "1m", 0, end, limit=1500)
+        opens = [b[0] for b in bars]
+        assert len(bars) == 2500
+        assert len(set(opens)) == 2500          # no duplicate candles across pages
+        assert opens == sorted(opens)           # monotonic
+        # 3 data pages (1000 + 1000 + 500) then 1 terminating empty page: the
+        # calendar-safe ``+1`` cursor lands 1 ms past the last candle (just shy
+        # of ``end``), so the loop probes once more and breaks on the empty page.
+        assert len(client.calls) == 4

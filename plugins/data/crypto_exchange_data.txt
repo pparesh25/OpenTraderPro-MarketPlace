@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 
 def _crypto_segment_metadata() -> dict:
-    """Pretty labels + ordering for the three Binance segments this plugin
+    """Pretty labels + ordering for the Binance segments this plugin
     dumps into symbol_master. Presentation-only — perp-vs-dated and the
     quote-asset pair facet are DERIVED by the app from the typed rows
     (instrument_type / quote_asset), not declared here. ``{}`` on an older app."""
@@ -73,6 +73,7 @@ def _crypto_segment_metadata() -> dict:
         SPOT: sm(display_name="Spot", group="BINANCE", order=1),
         USDM: sm(display_name="USD-M Futures", group="BINANCE", order=2),
         COINM: sm(display_name="COIN-M Futures", group="BINANCE", order=3),
+        OPTIONS: sm(display_name="European Options", group="BINANCE", order=4),
     }
 
 
@@ -96,6 +97,8 @@ def _build_crypto_capabilities() -> Capabilities:
             "CRYPTO": SPOT,
             "BINANCE_USDM": USDM,
             "BINANCE_COINM": COINM,
+            "BINANCE_OPTIONS": OPTIONS,
+            "BINANCE_EAPI": OPTIONS,
         }),
     )
     meta = _crypto_segment_metadata()
@@ -174,7 +177,18 @@ TIMEFRAME_MAP: dict[str, str] = {
 SPOT = "CRYPTO_SPOT"
 USDM = "USDM_FUTURES"
 COINM = "COINM_FUTURES"
-SUPPORTED_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM)
+OPTIONS = "CRYPTO_OPTIONS"     # Binance EAPI European options (BTC/ETH/…)
+SUPPORTED_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM, OPTIONS)
+
+# Segments the SHARED ``BinanceSession`` can fetch exchange-info / cache for.
+# A single session per alias is created by whichever plugin half (this data
+# file or crypto_exchange_exec.txt) loads first, so BOTH copies must be able
+# to load every segment EITHER half needs. The data side dumps options but the
+# exec side may own the shared instance — hence OPTIONS lives here even though
+# the exec file deliberately keeps it OUT of its ``SUPPORTED_SEGMENTS`` (no
+# options order route). Kept identical in the exec file so the byte-identical
+# session behaves the same regardless of which factory won the construct race.
+_SESSION_SEGMENTS: tuple[str, ...] = (SPOT, USDM, COINM, OPTIONS)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -204,10 +218,10 @@ class BinanceSession:
 
         # Per-segment exchange-info caches ({"BTCUSDT": {…filters…}, …}).
         self._symbol_cache: dict[str, dict[str, dict]] = {
-            SPOT: {}, USDM: {}, COINM: {},
+            SPOT: {}, USDM: {}, COINM: {}, OPTIONS: {},
         }
         self._last_symbol_update: dict[str, float] = {
-            SPOT: 0.0, USDM: 0.0, COINM: 0.0,
+            SPOT: 0.0, USDM: 0.0, COINM: 0.0, OPTIONS: 0.0,
         }
 
         # Serialise concurrent REST calls — python-binance's ``Client``
@@ -350,7 +364,7 @@ class BinanceSession:
     # ── Exchange info cache ──────────────────────────────────────────
     def load_symbols(self, segment: str = SPOT, force: bool = False) -> None:
         """Fetch and cache exchange info for ``segment`` (1 h TTL)."""
-        if self._client is None or segment not in SUPPORTED_SEGMENTS:
+        if self._client is None or segment not in _SESSION_SEGMENTS:
             return
         if (
             not force
@@ -360,15 +374,23 @@ class BinanceSession:
             return
 
         fetcher = {
-            SPOT:  "get_exchange_info",
-            USDM:  "futures_exchange_info",
-            COINM: "futures_coin_exchange_info",
+            SPOT:    "get_exchange_info",
+            USDM:    "futures_exchange_info",
+            COINM:   "futures_coin_exchange_info",
+            OPTIONS: "options_exchange_info",
         }[segment]
         try:
             with self.api_lock:
                 info = getattr(self._client, fetcher)()
+            # Spot / futures exchangeInfo lists rows under ``"symbols"``; the
+            # EAPI options exchangeInfo lists them under ``"optionSymbols"``.
+            rows = (
+                info.get("optionSymbols")
+                if segment == OPTIONS
+                else info.get("symbols")
+            )
             cache: dict[str, dict] = {}
-            for sym in info.get("symbols", []):
+            for sym in (rows or []):
                 cache[sym["symbol"].upper()] = sym
             self._symbol_cache[segment] = cache
             self._last_symbol_update[segment] = time.time()
@@ -552,7 +574,7 @@ class BinanceSession:
         self._client = None
         self._configured = False
         self._authenticated = False
-        for seg in SUPPORTED_SEGMENTS:
+        for seg in _SESSION_SEGMENTS:
             self._symbol_cache[seg].clear()
             self._last_symbol_update[seg] = 0.0
 
@@ -764,6 +786,13 @@ class DataPlugin(DataPluginV2):
                         client, symbol.upper(), interval,
                         int(start_ms), int(end_ms),
                     )
+                elif segment == OPTIONS:
+                    # EAPI has no auto-paginating klines wrapper and caps each
+                    # response — page the raw ``options_klines`` ourselves.
+                    klines = _options_historical_klines(
+                        client, symbol.upper(), interval,
+                        int(start_ms), int(end_ms),
+                    )
                 else:
                     fetcher = {
                         SPOT: "get_historical_klines",
@@ -815,13 +844,18 @@ class DataPlugin(DataPluginV2):
                 if q and q not in sym:
                     continue
                 info = self._session.symbol_info(sym, seg) or {}
+                base = info.get("baseAsset", "")
                 hits.append(SymbolInfo(
                     symbol=sym,
                     exchange=seg,
                     segment=seg,
                     tick_size=_tick_size_of(info),
                     lot_size=1,   # crypto uses float quantities via step_size
-                    display_name=f"{info.get('baseAsset', '')}/{info.get('quoteAsset', '')}",
+                    # EAPI option rows have no baseAsset (the symbol already
+                    # encodes underlying/expiry/strike) → fall back to it.
+                    display_name=(
+                        f"{base}/{info.get('quoteAsset', '')}" if base else sym
+                    ),
                 ))
                 if len(hits) >= 20:
                     return hits
@@ -836,7 +870,11 @@ class DataPlugin(DataPluginV2):
         :class:`SymbolRecord`. USDM / COINM rows carry the contract type
         (perpetual → ``CRYPTO_PERP`` vs dated future → ``CRYPTO_FUTURE`` with
         its delivery expiry) + the base-asset underlying so the app can group
-        a futures board; SPOT rows are plain ``CRYPTO_SPOT``.
+        a futures board; SPOT rows are plain ``CRYPTO_SPOT``. OPTIONS (EAPI)
+        rows map to the generic ``OPTION`` type carrying expiry + strike +
+        CE/PE leg + the spot ``underlying`` they settle against, so the app's
+        data-driven option-chain builder lights up exactly as it does for an
+        NSE/MCX chain.
         """
         if not self._session.is_authenticated:
             raise RuntimeError("Not authenticated.")
@@ -850,10 +888,38 @@ class DataPlugin(DataPluginV2):
             base = str(info.get("baseAsset", ""))
             quote = str(info.get("quoteAsset", ""))
             step, min_qty = _lot_filter_of(info)
+            strike: float | None = None
+            option_type: str | None = None
+            display_name = f"{base}/{quote}" if (base or quote) else sym
             if seg == SPOT:
                 itype = InstrumentType.CRYPTO_SPOT
                 expiry: date | None = None
                 underlying: str | None = None
+            elif seg == OPTIONS:
+                # Binance EAPI (European) options: each row owns its expiry,
+                # strike and CALL/PUT side plus the spot ``underlying`` it
+                # settles against (e.g. BTC-260925-145000-C → BTCUSDT). Reuse
+                # the generic ``OPTION`` type (there is no CRYPTO_OPTION) so the
+                # app's option-chain builder routes it down the same data-driven
+                # path as NSE/MCX. The chain groups legs as CE/PE, and Binance
+                # options ARE European-style, so CALL→CE / PUT→PE is exact —
+                # not a relabel hack (CE = Call European, PE = Put European).
+                itype = InstrumentType.OPTION
+                expiry = _coerce_delivery(info.get("expiryDate"))
+                underlying = str(info.get("underlying", "")) or None
+                strike = _safe_float_or_none(info.get("strikePrice"))
+                # Map the leg explicitly; SKIP (don't mislabel) an unknown side
+                # so a future Binance spelling can't masquerade as a PUT.
+                option_type = {"CALL": "CE", "PUT": "PE"}.get(
+                    str(info.get("side", "")).upper()
+                )
+                if option_type is None:
+                    logger.warning(
+                        "Binance[%s] skipping option %s with unknown side %r",
+                        self.alias, sym, info.get("side"),
+                    )
+                    continue
+                display_name = sym
             else:
                 # Perp vs dated is decided by whether a REAL delivery date
                 # exists — NOT by the ``contractType`` string. Binance ships
@@ -876,13 +942,15 @@ class DataPlugin(DataPluginV2):
                 exchange=seg,
                 segment=seg,
                 instrument_type=itype,
-                display_name=f"{base}/{quote}" if (base or quote) else sym,
+                display_name=display_name,
                 tick_size=_tick_size_of(info),
                 step_size=step,
                 min_quantity=min_qty,
                 quote_asset=quote or None,
                 expiry=expiry,
                 underlying_symbol=underlying,
+                strike=strike,
+                option_type=option_type,
             ))
         return records
 
@@ -989,6 +1057,13 @@ class DataPlugin(DataPluginV2):
         there. Falls back to the spot socket when ``FuturesType`` is unavailable
         (very old python-binance) so the feed degrades rather than breaks.
 
+        EAPI options use the ``<symbol>@optionTicker`` 24h stream
+        (``start_options_ticker_socket``): live-captured, it delivers a
+        SPOT-shaped slim payload (``c``/``o``/``h``/``l`` + 24h volume under
+        ``v``, no bid/ask, no ``x``) — NOT the rich ``V``/greeks schema the
+        published docs list — so ``_on_ticker_message`` handles it on the same
+        path as spot, deriving prev-close from ``c`` − ``p`` like futures.
+
         F-S2-bin-multivenue — the callback is bound to ``exchange`` so this
         socket's ticks carry the venue they were subscribed under, even when the
         SAME symbol also streams on another venue (e.g. BTCUSDT spot + USD-M)."""
@@ -1000,6 +1075,11 @@ class DataPlugin(DataPluginV2):
                 callback=cb,
                 symbol=symbol_lower,
                 futures_type=ftype,
+            )
+        if seg == OPTIONS:
+            return self._bm.start_options_ticker_socket(
+                callback=cb,
+                symbol=symbol_lower,
             )
         return self._bm.start_symbol_ticker_socket(
             callback=cb,
@@ -1123,7 +1203,11 @@ class DataPlugin(DataPluginV2):
         # Binance "v" is cumulative 24h base volume — per-tick delta helps
         # OHLCV bar-builders reconstruct real per-tick volume. Keyed by
         # (symbol, exchange) so the same symbol on two venues keeps separate
-        # cumulative baselines (F-S2-bin-multivenue).
+        # cumulative baselines (F-S2-bin-multivenue). NOTE: the EAPI options
+        # @optionTicker stream delivers a SPOT-shaped slim payload (live-
+        # captured: ``c``/``o``/``h``/``l`` + volume under ``v``, no bid/ask,
+        # no ``x``) — NOT the rich "V"/greeks schema the published docs list —
+        # so options need NO field remap and flow through this same path.
         vkey = (symbol, exchange)
         cum_vol = float(msg.get("v", 0.0))
         prev = self._last_cum_volume.get(vkey, 0.0)
@@ -1230,6 +1314,7 @@ def _resolve_segment(exchange: str) -> str:
     * ``"BINANCE_SPOT"`` / ``"SPOT"`` → SPOT
     * ``"USDM"`` / ``"USD-M"``       → USDM_FUTURES
     * ``"COINM"`` / ``"COIN-M"``     → COINM_FUTURES
+    * ``"OPTIONS"`` / ``"EAPI"``     → CRYPTO_OPTIONS
     * anything else                 → SPOT
     """
     if not exchange:
@@ -1241,6 +1326,9 @@ def _resolve_segment(exchange: str) -> str:
         return USDM
     if e in (COINM, "COINM", "COINM_FUTURES", "COIN_M", "COIN_M_FUTURES"):
         return COINM
+    if e in (OPTIONS, "OPTIONS", "CRYPTO_OPTIONS", "EAPI",
+             "BINANCE_OPTIONS", "BINANCE_EAPI"):
+        return OPTIONS
     return SPOT
 
 
@@ -1291,6 +1379,48 @@ def _coin_m_historical_klines(
             break
         out.extend(chunk)
         nxt = int(chunk[-1][0]) + step     # next candle after this page's last
+        if nxt <= cursor:                  # no forward progress → stop
+            break
+        cursor = nxt
+    return out
+
+
+def _options_historical_klines(
+    client, symbol: str, interval: str,
+    start_ms: int, end_ms: int, limit: int = 1000,
+) -> list:
+    """Paginated EAPI options historical klines over ``[start_ms, end_ms]``.
+
+    python-binance exposes only the single-shot ``options_klines`` (no
+    auto-paginating ``*_historical_klines`` wrapper), and the eapi endpoint
+    caps a response at ~1000 candles (hence the ``limit`` default) — so page
+    it ourselves. Unlike dapi (COIN-M), eapi returns candles FORWARD from the
+    window start, so the bounded-window cursor loop advances correctly here:
+    request ``cursor → cursor + step*limit`` windows and step PAST each page's
+    last open. A freshly-listed option whose data begins after ``cursor`` just
+    returns from its listing forward — collected fine.
+    """
+    step = _interval_ms(interval)
+    out: list = []
+    cursor = int(start_ms)
+    end = int(end_ms)
+    while cursor < end:
+        window_end = min(cursor + step * limit, end)
+        chunk = client.options_klines(
+            symbol=symbol, interval=interval,
+            startTime=cursor, endTime=window_end, limit=limit,
+        )
+        if not chunk:
+            break
+        out.extend(chunk)
+        # Advance ONE ms past the last open, not by ``step``: the calendar
+        # intervals (1w/1M) have a variable real span (e.g. a 28-day month is
+        # shorter than the 30-day ``step``), and a fixed ``+step`` cursor would
+        # skip the next candle whenever the real span < step. ``+1`` lets the
+        # endpoint return the next candle (openTime >= startTime) for any span
+        # without re-fetching the last (openTime < cursor), and the guard below
+        # still stops a non-advancing page.
+        nxt = int(chunk[-1][0]) + 1
         if nxt <= cursor:                  # no forward progress → stop
             break
         cursor = nxt
