@@ -1736,6 +1736,15 @@ class ExecPlugin(ExecPluginV2):
             return OrderResponse(ok=False, error="quantity must be positive")
 
         segment = _resolve_segment(request.segment or request.exchange)
+        if segment not in SUPPORTED_SEGMENTS:
+            # Fail CLOSED. The data side dumps a CRYPTO_OPTIONS segment, but this
+            # exec half implements no options order route (OPTIONS is absent from
+            # SUPPORTED_SEGMENTS). Refuse here rather than let an unrecognised
+            # segment fall through to a SPOT order on an option symbol.
+            return OrderResponse(
+                ok=False,
+                error=f"crypto_exchange exec does not trade {segment} orders",
+            )
         client = self._session.client
         if client is None:
             return OrderResponse(ok=False, error="client unavailable")
@@ -2246,6 +2255,13 @@ def _resolve_segment(exchange: str) -> str:
         return USDM
     if e in (COINM, "COINM", "COINM_FUTURES", "COIN_M", "COIN_M_FUTURES"):
         return COINM
+    # Recognise OPTIONS so the order path can REFUSE it explicitly (it is not in
+    # SUPPORTED_SEGMENTS — this exec half trades no options). Without this branch
+    # an option exchange string collapsed to the SPOT default below and a
+    # malformed spot order could be attempted on an option symbol.
+    if e in (OPTIONS, "OPTIONS", "CRYPTO_OPTIONS", "EAPI",
+             "BINANCE_OPTIONS", "BINANCE_EAPI"):
+        return OPTIONS
     return SPOT
 
 

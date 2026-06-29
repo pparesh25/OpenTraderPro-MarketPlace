@@ -84,6 +84,7 @@ def _make_plugin(ns: dict, session):
     DataPlugin = ns["DataPlugin"]
     p = object.__new__(DataPlugin)        # skip __init__ (session registry / net)
     p._session = session
+    p.alias = "test"                      # used by log lines (e.g. skip warnings)
     return p
 
 
@@ -171,6 +172,20 @@ class TestOptionsClassification:
         assert call.underlying_symbol == "BTCUSDT"
         assert recs["BTC-260925-145000-P"].option_type == "PE"
         assert recs["ETH-260925-4000-C"].underlying_symbol == "ETHUSDT"
+
+    def test_unknown_option_side_is_skipped_not_mislabeled(self):
+        ns = _load_ns()
+        OPTIONS = ns["OPTIONS"]
+        p = _make_plugin(ns, _FakeSession({OPTIONS: {
+            "BTC-260925-145000-C": _opt_info(
+                "BTC-260925-145000-C", "BTCUSDT", "CALL", 145000, _ms(2026, 9, 25)),
+            # A side Binance never sends today — must be DROPPED, not labeled PE.
+            "BTC-260925-145000-X": _opt_info(
+                "BTC-260925-145000-X", "BTCUSDT", "WEIRD", 145000, _ms(2026, 9, 25)),
+        }}))
+        recs = {r.symbol: r for r in p.fetch_instruments(OPTIONS)}
+        assert recs["BTC-260925-145000-C"].option_type == "CE"
+        assert "BTC-260925-145000-X" not in recs
 
     def test_options_carry_tick_and_lot_from_filters(self):
         ns = _load_ns()
@@ -527,4 +542,7 @@ class TestOptionsHistoricalPagination:
         assert len(bars) == 2500
         assert len(set(opens)) == 2500          # no duplicate candles across pages
         assert opens == sorted(opens)           # monotonic
-        assert len(client.calls) == 3           # advanced by ACTUAL last, not limit
+        # 3 data pages (1000 + 1000 + 500) then 1 terminating empty page: the
+        # calendar-safe ``+1`` cursor lands 1 ms past the last candle (just shy
+        # of ``end``), so the loop probes once more and breaks on the empty page.
+        assert len(client.calls) == 4

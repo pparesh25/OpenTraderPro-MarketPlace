@@ -844,13 +844,18 @@ class DataPlugin(DataPluginV2):
                 if q and q not in sym:
                     continue
                 info = self._session.symbol_info(sym, seg) or {}
+                base = info.get("baseAsset", "")
                 hits.append(SymbolInfo(
                     symbol=sym,
                     exchange=seg,
                     segment=seg,
                     tick_size=_tick_size_of(info),
                     lot_size=1,   # crypto uses float quantities via step_size
-                    display_name=f"{info.get('baseAsset', '')}/{info.get('quoteAsset', '')}",
+                    # EAPI option rows have no baseAsset (the symbol already
+                    # encodes underlying/expiry/strike) → fall back to it.
+                    display_name=(
+                        f"{base}/{info.get('quoteAsset', '')}" if base else sym
+                    ),
                 ))
                 if len(hits) >= 20:
                     return hits
@@ -903,10 +908,17 @@ class DataPlugin(DataPluginV2):
                 expiry = _coerce_delivery(info.get("expiryDate"))
                 underlying = str(info.get("underlying", "")) or None
                 strike = _safe_float_or_none(info.get("strikePrice"))
-                option_type = (
-                    "CE" if str(info.get("side", "")).upper() == "CALL"
-                    else "PE"
+                # Map the leg explicitly; SKIP (don't mislabel) an unknown side
+                # so a future Binance spelling can't masquerade as a PUT.
+                option_type = {"CALL": "CE", "PUT": "PE"}.get(
+                    str(info.get("side", "")).upper()
                 )
+                if option_type is None:
+                    logger.warning(
+                        "Binance[%s] skipping option %s with unknown side %r",
+                        self.alias, sym, info.get("side"),
+                    )
+                    continue
                 display_name = sym
             else:
                 # Perp vs dated is decided by whether a REAL delivery date
@@ -1375,19 +1387,18 @@ def _coin_m_historical_klines(
 
 def _options_historical_klines(
     client, symbol: str, interval: str,
-    start_ms: int, end_ms: int, limit: int = 1500,
+    start_ms: int, end_ms: int, limit: int = 1000,
 ) -> list:
     """Paginated EAPI options historical klines over ``[start_ms, end_ms]``.
 
     python-binance exposes only the single-shot ``options_klines`` (no
     auto-paginating ``*_historical_klines`` wrapper), and the eapi endpoint
-    caps a response at ~1000 candles regardless of the requested ``limit`` —
-    so page it ourselves. Unlike dapi (COIN-M), eapi returns candles FORWARD
-    from the window start, so the bounded-window cursor loop (also used for
-    COIN-M, where it is forced by endTime-anchoring) advances correctly here
-    too: request ``cursor → cursor + step*limit`` windows and step one candle
-    past each page's last open. A freshly-listed option whose data begins
-    after ``cursor`` just returns from its listing forward — collected fine.
+    caps a response at ~1000 candles (hence the ``limit`` default) — so page
+    it ourselves. Unlike dapi (COIN-M), eapi returns candles FORWARD from the
+    window start, so the bounded-window cursor loop advances correctly here:
+    request ``cursor → cursor + step*limit`` windows and step PAST each page's
+    last open. A freshly-listed option whose data begins after ``cursor`` just
+    returns from its listing forward — collected fine.
     """
     step = _interval_ms(interval)
     out: list = []
@@ -1402,7 +1413,14 @@ def _options_historical_klines(
         if not chunk:
             break
         out.extend(chunk)
-        nxt = int(chunk[-1][0]) + step     # next candle after this page's last
+        # Advance ONE ms past the last open, not by ``step``: the calendar
+        # intervals (1w/1M) have a variable real span (e.g. a 28-day month is
+        # shorter than the 30-day ``step``), and a fixed ``+step`` cursor would
+        # skip the next candle whenever the real span < step. ``+1`` lets the
+        # endpoint return the next candle (openTime >= startTime) for any span
+        # without re-fetching the last (openTime < cursor), and the guard below
+        # still stops a non-advancing page.
+        nxt = int(chunk[-1][0]) + 1
         if nxt <= cursor:                  # no forward progress → stop
             break
         cursor = nxt
