@@ -998,7 +998,12 @@ class DataPlugin(DataPluginV2):
                 underlying_symbol=(
                     str(row.get("name")) or None if is_derivative else None
                 ),
-                underlying_exchange=exch if is_derivative else None,
+                # The underlying lists on its CASH exchange, not this
+                # derivative's F&O exchange (see _DERIV_UNDERLYING_EXCHANGE).
+                underlying_exchange=(
+                    _DERIV_UNDERLYING_EXCHANGE.get(exch, exch)
+                    if is_derivative else None
+                ),
                 sector=sector,
             ))
         if unmapped_mcx:
@@ -1206,6 +1211,24 @@ _KITE_ITYPE: dict[str, InstrumentType] = {
     "FUT": InstrumentType.FUTURE,
     "CE": InstrumentType.OPTION,
     "PE": InstrumentType.OPTION,
+}
+
+
+# A derivative's UNDERLYING lists on its CASH exchange, not the derivative's own
+# F&O/currency exchange: an NFO NIFTY future's underlying index is on NSE, a BFO
+# SENSEX option's on BSE, an NSE/BSE currency derivative's pair conceptually on
+# NSE/BSE. Populating ``SymbolRecord.underlying_exchange`` with the derivative's
+# OWN exchange (the old ``exch``) made the app's underlying-record lookup
+# (e.g. RELIANCE-future -> RELIANCE-cash for the regime UNDERLYING_SPOT/FUTURE
+# edge) search the wrong exchange and silently miss. MCX commodity derivatives
+# DO share their underlying's exchange (both MCX), so they are intentionally not
+# remapped (``.get(exch, exch)`` returns ``exch``).
+_DERIV_UNDERLYING_EXCHANGE: dict[str, str] = {
+    "NFO": "NSE",   # NSE equity/index F&O  -> underlying on NSE
+    "BFO": "BSE",   # BSE equity/index F&O  -> underlying on BSE
+    "CDS": "NSE",   # NSE currency derivs   -> underlying pair on NSE
+    "BCD": "BSE",   # BSE currency derivs   -> underlying pair on BSE
+    # MCX commodity derivatives: underlying stays on MCX (no remap).
 }
 
 
