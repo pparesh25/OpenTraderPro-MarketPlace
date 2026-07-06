@@ -62,3 +62,49 @@ class TestKiteExecOptionSegments:
             assert f'"{exch}"' in data, f"{exch} not referenced in kite_broker_data"
         segments = ns["ExecPlugin"].CAPABILITIES.segments
         assert set(_DERIVATIVE_EXCHANGES).issubset(set(segments))
+
+
+class TestKiteShortProducts:
+    """v3-P5c-live-g / D4 — the exec half declares which product a sell-to-open
+    may use per segment, so the router can auto-assign a short-capable product.
+    Without this every ENTRY_SHORT on Zerodha is rejected (fail-safe)."""
+
+    def _caps(self):
+        return _load_ns()["ExecPlugin"].CAPABILITIES
+
+    def test_short_products_declared(self):
+        sp = dict(getattr(self._caps(), "short_products", {}))
+        assert sp, "kite exec must declare short_products or live shorts are inert"
+
+    def test_equity_short_is_intraday_only_never_cnc(self):
+        # The load-bearing safety invariant: an equity short auto-assigns MIS,
+        # NEVER CNC — a delivery short needs stock-borrow/SLB (not modelled).
+        sp = self._caps().short_products
+        for seg in ("NSE_EQ", "BSE_EQ"):
+            assert sp[seg] == ("MIS",), f"{seg} equity short must be MIS-only, got {sp[seg]!r}"
+            assert "CNC" not in sp[seg]
+
+    def test_fno_short_defaults_to_nrml(self):
+        # Derivatives are two-sided; NRML (carry) is the [0] auto-assign default,
+        # MIS also allowed.
+        sp = self._caps().short_products
+        for seg in ("NFO", "BFO", "MCX", "CDS", "BCD"):
+            assert sp[seg][0] == "NRML", f"{seg} short default should be NRML, got {sp[seg]!r}"
+            assert set(sp[seg]) == {"NRML", "MIS"}
+
+    def test_short_segments_are_all_tradable(self):
+        # Every segment with a short product must be an advertised, orderable
+        # segment (else the short would resolve a product for an un-routable seg).
+        caps = self._caps()
+        assert set(caps.short_products).issubset(set(caps.segments))
+
+    def test_short_products_subset_of_product_types(self):
+        # Every short-capable product must be a product the plugin actually
+        # supports (MIS/NRML are in product_types; a typo'd product would be
+        # advertised as short-capable but rejected at place_order).
+        caps = self._caps()
+        for seg, prods in caps.short_products.items():
+            for p in prods:
+                assert p in caps.product_types, (
+                    f"{seg} short product {p!r} not in product_types {caps.product_types!r}"
+                )

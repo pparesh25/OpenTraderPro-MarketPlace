@@ -996,7 +996,7 @@ class DataPlugin(DataPluginV2):
                 strike=_kite_pos(row.get("strike")) if is_option else None,
                 option_type=itype_str if is_option else None,
                 underlying_symbol=(
-                    str(row.get("name")) or None if is_derivative else None
+                    _underlying_symbol(row) if is_derivative else None
                 ),
                 # The underlying lists on its CASH exchange, not this
                 # derivative's F&O exchange (see _DERIV_UNDERLYING_EXCHANGE).
@@ -1212,6 +1212,44 @@ _KITE_ITYPE: dict[str, InstrumentType] = {
     "CE": InstrumentType.OPTION,
     "PE": InstrumentType.OPTION,
 }
+
+
+# Index F&O carry a SHORT root name in Kite's ``name`` field ("NIFTY",
+# "BANKNIFTY"), but the app ingests the index SPOT under its full Zerodha
+# tradingsymbol ("NIFTY 50", "NIFTY BANK"). The regime index-trend /
+# UNDERLYING_FUTURE edge matches ``underlying_symbol`` against that ingested
+# index symbol, so a raw "NIFTY" never resolves — the per-symbol gate then
+# passes UNGATED (soft-fail: silently un-gated at full size, never blocked).
+# Alias the known index roots to their tradable index name so the gate actually
+# fires. Every other underlying (stocks, MCX commodities, currency pairs)
+# already IS its own tradable symbol and is intentionally NOT in this map — it
+# passes through unchanged. An unmapped or slightly-mismatched index name is
+# harmless: it simply stays ungated, exactly as before this fix.
+_INDEX_UNDERLYING_ALIAS: dict[str, str] = {
+    "NIFTY": "NIFTY 50",           # NSE — app-seed confirmed (regime/seed.py)
+    "BANKNIFTY": "NIFTY BANK",     # NSE — app-seed confirmed
+    "FINNIFTY": "NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NIFTY MID SELECT",
+    "NIFTYNXT50": "NIFTY NEXT 50",
+    # BSE index derivatives (SENSEX / BANKEX) ingest under the same name —
+    # identity, so no alias entry is needed.
+}
+
+
+def _underlying_symbol(row: dict) -> "str | None":
+    """A derivative's underlying name, aliased to its tradable index symbol.
+
+    Index F&O name their underlying by a short root ("NIFTY"); the app ingests
+    the index under its full tradingsymbol ("NIFTY 50"), so alias the known
+    roots (:data:`_INDEX_UNDERLYING_ALIAS`) and pass every other name through
+    verbatim. Missing/empty name -> ``None``. An unmapped index name simply
+    stays ungated downstream (soft-fail), never blocks — same as before.
+    """
+    raw = row.get("name")
+    name = str(raw) if raw else ""
+    if not name:
+        return None
+    return _INDEX_UNDERLYING_ALIAS.get(name.upper(), name)
 
 
 # A derivative's UNDERLYING lists on its CASH exchange, not the derivative's own

@@ -839,6 +839,42 @@ def _mcx_nonagri_close_time(today: date | None = None) -> dtime:
     return dtime(23, 55) if _is_us_dst_active(today) else dtime(23, 30)
 
 
+# ── Short-capable products per segment (v3-P5c-live-g / D4) ──────────────
+# Which product a SELL-to-open (short entry) may use, per segment. ``[0]`` is
+# the router's auto-assign default when a short pins no product; a short pinning
+# any listed product is honoured, one pinning an UNLISTED product is rejected.
+#
+# Equity (NSE_EQ / BSE_EQ) is INTRADAY-ONLY on purpose: a delivery (CNC) short
+# is not deliverable without stock-borrow / SLB (not modelled here), so CNC is
+# excluded and an equity short auto-assigns MIS — this structurally prevents an
+# illegal delivery short. F&O / currency / commodity derivatives are naturally
+# two-sided, so a short there is an ordinary new open (NRML carry is the
+# default, MIS intraday is also allowed). A long / exit / buy-to-cover never
+# consults this map — it keeps the plain ``product_types`` fallback.
+_SHORT_PRODUCTS = MappingProxyType({
+    "NSE_EQ": ("MIS",),
+    "BSE_EQ": ("MIS",),
+    "NFO": ("NRML", "MIS"),
+    "BFO": ("NRML", "MIS"),
+    "MCX": ("NRML", "MIS"),
+    "CDS": ("NRML", "MIS"),
+    "BCD": ("NRML", "MIS"),
+})
+
+# ``ExecCapabilities.short_products`` was added additively in the app at
+# v3-P5c-live-e (default empty). This marketplace plugin is public and may be
+# installed on an OLDER app whose ``ExecCapabilities`` lacks the field, where
+# passing the kwarg would ``TypeError`` and take the WHOLE Zerodha connector
+# offline. Splat it only when the host app supports it — an older app then
+# loads long-only (it can't place a short anyway; the runner's short gate is
+# post-slice-e too), so the connector keeps working either way.
+_SHORT_PRODUCTS_KWARG: dict = (
+    {"short_products": _SHORT_PRODUCTS}
+    if "short_products" in getattr(ExecCapabilities, "__dataclass_fields__", {})
+    else {}
+)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # ExecPlugin
 # ══════════════════════════════════════════════════════════════════════
@@ -893,6 +929,11 @@ class ExecPlugin(ExecPluginV2):
             "NSE": "NSE_EQ",
             "BSE": "BSE_EQ",
         }),
+        # v3-P5c-live-g (D4) — short-capable products per segment (see
+        # ``_SHORT_PRODUCTS`` above). Splatted conditionally so an app whose
+        # ``ExecCapabilities`` predates the field still loads this connector
+        # (long-only) rather than TypeError-ing the whole plugin offline.
+        **_SHORT_PRODUCTS_KWARG,
     )
 
     _THROTTLE_RESET_SECS: ClassVar[float] = 300.0
