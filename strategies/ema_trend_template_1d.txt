@@ -1,0 +1,171 @@
+# plugin-type: strategy
+# ema_trend_template.txt — EMA Trend Template with Donchian Breakout (STOP-LOSS FIXED)
+#
+# BUY CONDITIONS (all must be true on EOD close):
+#   1. price > EMA50 > EMA150 > EMA200          (EMA stack alignment)
+#   2. close > (52-week high * 0.85)            (within 15% of 52-week high)
+#   3. close > (52-week low  * 1.50)            (at least 50% above 52-week low)
+#   4. close > 60-day Donchian Channel High (excluding current bar)
+#
+# SELL / EXIT CONDITIONS:
+#   1. STOP-LOSS  : close < entry_price * 0.85  (15% fall from entry)
+#   2. EMA-CROSS  : close < EMA50
+#   3. PROFIT-TGT : close > entry_price * 3.00
+
+import math
+import talib
+import numpy as np
+from opentrader.strategy.base import StrategyBase
+
+
+class Strategy(StrategyBase):
+    name = "EMA Trend Template (1D Breakout)"
+    version = "4.1"
+    description = (
+        "Buy: EMA stack + near 52wk-high + above 52wk-low + "
+        "60-day Donchian breakout. Fixed stop-loss calculation."
+    )
+
+    # ── Priority Symbols ─────────────────────────────────────────────────
+    # Symbols listed here get first preference when multiple signals fire
+    # on the same day but fewer slots are available than signals.
+    # Priority signals always fill before non-priority signals.
+    # Leave empty to use default order (watchlist / signal generation order).
+    #
+    # Example:
+    #   priority_symbols = ["RELIANCE", "HDFCBANK", "TCS", "INFY", "ICICIBANK"]
+    priority_symbols = []
+
+    parameters = {
+        # EMA periods
+        "ema_fast":   50,
+        "ema_mid":   150,
+        "ema_slow":  200,
+        # Buy filter: near 52-week high (within %)
+        "near_high_pct":  15.0,
+        # Buy filter: above 52-week low (at least % above)
+        "above_low_pct":  50.0,
+        # Bar lookback for 52-week high/low
+        "week52_bars":   252,
+        # Donchian Channel breakout period (days)
+        "donchian_period": 60,
+        # Exit thresholds (%)
+        "stop_loss_pct":     15.0,    # 10% stop-loss from entry
+        "profit_target_pct": 300.0,   # 200% profit = 3x entry
+    }
+
+    def run(self, ctx):
+        signals = []
+
+        p = self.parameters
+        ema_fast_p   = int(p["ema_fast"])
+        ema_mid_p    = int(p["ema_mid"])
+        ema_slow_p   = int(p["ema_slow"])
+        week52       = int(p["week52_bars"])
+        donchian_p   = int(p["donchian_period"])
+        near_high_f  = 1.0 - p["near_high_pct"] / 100.0
+        above_low_f  = 1.0 + p["above_low_pct"] / 100.0
+        stop_f       = 1.0 - p["stop_loss_pct"] / 100.0
+        target_f     = 1.0 + p["profit_target_pct"] / 100.0
+
+        min_bars = max(ema_slow_p, week52, donchian_p) + 10
+
+        for symbol in ctx.symbols:
+            try:
+                df = ctx.ohlcv(symbol, "D")
+                if df is None or len(df) < min_bars:
+                    continue
+
+                close = df["close"].values.astype(np.float64)
+                high = df["high"].values.astype(np.float64)
+
+                # ---- Technical Indicators ----
+                ema50 = talib.EMA(close, ema_fast_p)
+                ema150 = talib.EMA(close, ema_mid_p)
+                ema200 = talib.EMA(close, ema_slow_p)
+
+                price = close[-1]
+                e50 = ema50[-1]
+                e150 = ema150[-1]
+                e200 = ema200[-1]
+
+                # ---- Donchian High (previous 60 days, excluding today) ----
+                if len(high) > donchian_p:
+                    donchian_level = float(np.max(high[-(donchian_p + 1):-1]))
+                else:
+                    continue
+
+                # ---- 52-week High/Low (previous 252 days, excluding today) ----
+                if len(close) > week52:
+                    w52_slice = close[-(week52 + 1):-1]
+                    w52_high = float(np.max(w52_slice))
+                    w52_low = float(np.min(w52_slice))
+                else:
+                    continue
+
+                # Skip NaN values
+                if any(math.isnan(v) for v in (price, e50, e150, e200, donchian_level, w52_high, w52_low)):
+                    continue
+
+                # ---- Get position safely ----
+                position = None
+                entry_price = None
+                
+                if hasattr(ctx, "get_bt_position"):
+                    try:
+                        position = ctx.get_bt_position(symbol)
+                        if position is not None:
+                            # Extract entry_price safely (handle different return types)
+                            if hasattr(position, "entry_price"):
+                                entry_price = position.entry_price
+                                # Convert to float if it's a Series/array
+                                if hasattr(entry_price, "iloc"):
+                                    entry_price = float(entry_price.iloc[-1])
+                                elif isinstance(entry_price, (np.ndarray, list)):
+                                    entry_price = float(entry_price[-1])
+                                else:
+                                    entry_price = float(entry_price)
+                    except Exception:
+                        entry_price = None
+
+                # ---- EXIT CONDITIONS (if position exists) ----
+                if position is not None and entry_price is not None:
+                    # Stop-loss
+                    if price < entry_price * stop_f:
+                        sig = ctx.exit(symbol, source="STOP_LOSS")
+                        sig.metadata["exit_reason"] = f"STOP_LOSS (entry={entry_price:.2f}, price={price:.2f})"
+                        signals.append(sig)
+                        continue
+                    
+                    # EMA50 breakdown
+                    if price < e50:
+                        sig = ctx.exit(symbol, source="EMA50_CROSS")
+                        sig.metadata["exit_reason"] = f"EMA50_CROSS (price={price:.2f} < EMA50={e50:.2f})"
+                        signals.append(sig)
+                        continue
+                    
+                    # Profit target (3x)
+                    if price >= entry_price * target_f:
+                        sig = ctx.exit(symbol, source="PROFIT_TARGET")
+                        sig.metadata["exit_reason"] = f"PROFIT_TARGET ({((price/entry_price)-1)*100:.1f}%)"
+                        signals.append(sig)
+                        continue
+                    
+                    # Still holding
+                    continue
+
+                # ---- BUY CONDITIONS (only if no position) ----
+                ema_aligned = (price > e50 and e50 > e150 and e150 > e200)
+                near_52wk_high = price >= w52_high * near_high_f
+                above_52wk_low = price >= w52_low * above_low_f
+                donchian_breakout = price > donchian_level
+
+                if ema_aligned and near_52wk_high and above_52wk_low and donchian_breakout:
+                    signals.append(ctx.buy(symbol, source="DONCHIAN_BREAKOUT"))
+
+            except Exception as e:
+                # Silent skip on error (but you can uncomment for debugging)
+                # ctx.log(f"Error processing {symbol}: {e}")
+                continue
+
+        return signals
