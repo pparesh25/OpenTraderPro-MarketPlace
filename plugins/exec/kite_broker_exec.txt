@@ -874,6 +874,26 @@ _SHORT_PRODUCTS_KWARG: dict = (
     else {}
 )
 
+# Zerodha auto-squares-off every open ``MIS`` position near the session close
+# (~15:20 IST); ``CNC`` (delivery) and ``NRML`` (F&O carry) are held overnight.
+# WHICH product codes mean "intraday" is broker-specific knowledge, so the app
+# no longer hardcodes it — it reads this declaration and applies one uniform
+# rule (square off at the session close resolved from ``get_market_hours``).
+# The Backtest panel reads the same tuple for the SELECTED broker, so a
+# simulation reproduces Zerodha's real carry-vs-square-off behaviour.
+#
+# ``ExecCapabilities.intraday_product_types`` was added additively in the app
+# (default empty), so splat it only when the host app supports it — exactly as
+# ``short_products`` above. An older app simply classifies nothing as intraday
+# and keeps this connector loading rather than TypeError-ing it offline.
+_INTRADAY_PRODUCTS_KWARG: dict = (
+    {"intraday_product_types": ("MIS",)}
+    if "intraday_product_types" in getattr(
+        ExecCapabilities, "__dataclass_fields__", {}
+    )
+    else {}
+)
+
 
 # ══════════════════════════════════════════════════════════════════════
 # ExecPlugin
@@ -934,6 +954,9 @@ class ExecPlugin(ExecPluginV2):
         # ``ExecCapabilities`` predates the field still loads this connector
         # (long-only) rather than TypeError-ing the whole plugin offline.
         **_SHORT_PRODUCTS_KWARG,
+        # Short Phase 0 — Zerodha's intraday (auto-square-off) product codes.
+        # Same conditional splat, same reason (see ``_INTRADAY_PRODUCTS_KWARG``).
+        **_INTRADAY_PRODUCTS_KWARG,
     )
 
     _THROTTLE_RESET_SECS: ClassVar[float] = 300.0
