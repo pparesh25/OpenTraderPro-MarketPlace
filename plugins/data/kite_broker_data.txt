@@ -651,6 +651,27 @@ def _mcx_nonagri_close_time(today: date | None = None) -> dtime:
     return dtime(23, 55) if _is_us_dst_active(today) else dtime(23, 30)
 
 
+def _session_segment(segment: str | None) -> str:
+    """Collapse a symbol_master segment code to its SESSION family.
+
+    This plugin's own instrument dump stamps derivative rows as
+    ``{EXCH}-FUT`` / ``{EXCH}-OPT`` (see :func:`_dump_segment`), and those
+    exact strings come back to :meth:`DataPlugin.get_market_hours` from
+    session-anchored consumers. A trading session is a property of the
+    EXCHANGE, not of the futures-vs-options split, so strip the suffix
+    before routing — pre-fix these codes fell through to the multi-venue
+    fallback union. Mirrors ``kite_broker_exec._session_segment`` (the exec
+    gate consults the exec plugin, the data gate consults this one; both
+    must agree on session boundaries). Unknown codes return unchanged
+    (upper-cased).
+    """
+    seg = (segment or "").strip().upper()
+    for suffix in ("-FUT", "-OPT"):
+        if seg.endswith(suffix):
+            return seg[: -len(suffix)]
+    return seg
+
+
 # ══════════════════════════════════════════════════════════════════════
 # DataPlugin
 # ══════════════════════════════════════════════════════════════════════
@@ -808,6 +829,11 @@ class DataPlugin(DataPluginV2):
         would reject — worse UX than fail-fast) AND winter non-agri
         orders silently slipped through the 23:30–23:55 gap that the
         broker had closed.
+
+        Segment codes are first collapsed via :func:`_session_segment`,
+        so this plugin's own dump forms (``NFO-FUT``/``CDS-OPT``/…)
+        resolve to their exchange session instead of falling through
+        to the multi-venue union.
         """
         ist = ZoneInfo("Asia/Kolkata")
         equity              = MarketWindow(dtime( 9, 15), dtime(15, 30), tz=ist)
@@ -819,7 +845,7 @@ class DataPlugin(DataPluginV2):
         )
         commodity_agri      = MarketWindow(dtime( 9,  0), dtime(21,  0), tz=ist)
         commodity_agri_early= MarketWindow(dtime( 9,  0), dtime(17,  0), tz=ist)
-        seg = (segment or "").upper()
+        seg = _session_segment(segment)
         if seg in {"CDS", "BCD", "NSE_CDS", "BSE_CDS"}:
             return (currency,)
         if seg == "MCX_AGRI":
@@ -1301,6 +1327,13 @@ _MCX_SECTORS: dict[str, str] = {
     "COTTONREF": "Agri-Commodity",
     "MENTHAOIL": "Agri-Commodity",
     "KAPAS": "Agri-Commodity",
+    # Review fix: CPO + COTTONCNDY (the two most-traded MCX agri) and the
+    # castor roots were unmapped → sector "Other" → the exec half's agri
+    # session split + 8-day tender advance NEVER fired for them.
+    "CPO": "Agri-Commodity",
+    "COTTONCNDY": "Agri-Commodity",
+    "CASTOR": "Agri-Commodity",
+    "CASTORSEED": "Agri-Commodity",
     # Mini / variant contracts (Zerodha tradingsymbol roots) — same sector as
     # their parent commodity; anything still unmapped falls to "Other" + a warn.
     "GOLDTEN": "Bullion",

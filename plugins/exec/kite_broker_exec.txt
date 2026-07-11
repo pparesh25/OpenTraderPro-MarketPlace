@@ -106,7 +106,23 @@ TIMEFRAME_MAP = {
     "1hour": "60minute", "1D": "day", "1W": "week", "1M": "month",
 }
 PRODUCT_MAP = {"CNC": "CNC", "MIS": "MIS", "NRML": "NRML"}
-ORDER_TYPE_MAP = {"MARKET": "MARKET", "LIMIT": "LIMIT", "STOP_LIMIT": "STOP_LIMIT", "STOP": "STOP"}
+# App order-type taxonomy → Kite Connect codes. Kite accepts ONLY
+# MARKET / LIMIT / SL (stop-limit) / SL-M (stop-market) — passing the app's
+# "STOP"/"STOP_LIMIT" verbatim (the pre-S6 identity map) made every live stop
+# order an InputException reject. ``_ORDER_TYPE_REVERSE`` translates broker
+# order books back into app codes so OrderRecord consumers (interlocks, UI)
+# see one taxonomy.
+ORDER_TYPE_MAP = {
+    "MARKET": "MARKET", "LIMIT": "LIMIT",
+    "STOP_LIMIT": "SL", "STOP": "SL-M",
+}
+_ORDER_TYPE_REVERSE = {
+    "MARKET": "MARKET", "LIMIT": "LIMIT",
+    "SL": "STOP_LIMIT", "SL-M": "STOP",
+}
+# NOTE: Zerodha's RMS blocks SL-M on OPTIONS (premium gaps) — an app "STOP"
+# on an NFO/BFO option maps to SL-M and is loudly broker-rejected; use
+# STOP_LIMIT (SL) for option stops.
 
 
 # ── Local redirect server for OAuth ────────────────────────────────────
@@ -839,6 +855,43 @@ def _mcx_nonagri_close_time(today: date | None = None) -> dtime:
     return dtime(23, 55) if _is_us_dst_active(today) else dtime(23, 30)
 
 
+def _session_segment(segment: str | None) -> str:
+    """Collapse a symbol_master segment code to its SESSION family.
+
+    The data half dumps derivative rows as ``{EXCH}-FUT`` / ``{EXCH}-OPT``
+    (``_dump_segment`` in ``kite_broker_data``), and those exact strings are
+    what the app's symbol_master hands back to session-anchored consumers
+    (the square-off services, the router's hours gate). A trading session is
+    a property of the EXCHANGE, not of the futures-vs-options split, so strip
+    the suffix before routing. Pre-fix, ``NFO-FUT``/``CDS-OPT``/… fell through
+    every branch into the multi-venue fallback union, whose LATEST close
+    (23:30/23:55 MCX) then anchored NFO/CDS square-offs hours after those
+    markets closed — the flatten orders could never fill. Unknown codes are
+    returned unchanged (upper-cased).
+    """
+    seg = (segment or "").strip().upper()
+    for suffix in ("-FUT", "-OPT"):
+        if seg.endswith(suffix):
+            return seg[: -len(suffix)]
+    return seg
+
+
+# MCX agri commodities share the ``MCX-FUT`` / ``MCX-OPT`` dump segments with
+# non-agri but close hours earlier (21:00 agri / 17:00 early-agri vs
+# 23:30/23:55 non-agri). The dump ``sector`` column marks them
+# ("Agri-Commodity"), and the UNDERLYING root name splits the two agri
+# sub-sessions. Only the LATE (21:00, internationally-referenceable) roots are
+# listed; every other agri root — including one this map has never heard of —
+# resolves to the EARLIEST session (17:00), because a too-early forced flatten
+# still fills while a too-late one is broker-rejected after that commodity's
+# real close. Consumed by :meth:`ExecPlugin.session_segment_for`.
+_MCX_AGRI_SECTOR = "AGRI-COMMODITY"
+_MCX_AGRI_LATE_ROOTS: frozenset[str] = frozenset({
+    # 09:00–21:00 IST session (cotton complex / CPO)
+    "COTTON", "COTTONREF", "COTTONOIL", "COTTONCNDY", "KAPAS", "CPO",
+})
+
+
 # ── Short-capable products per segment (v3-P5c-live-g / D4) ──────────────
 # Which product a SELL-to-open (short entry) may use, per segment. ``[0]`` is
 # the router's auto-assign default when a short pins no product; a short pinning
@@ -874,6 +927,52 @@ _SHORT_PRODUCTS_KWARG: dict = (
     else {}
 )
 
+# Per-segment default product for an UNPINNED long/exit order (S6). Without
+# it the app's global fallback is ``product_types[0]`` = CNC — the delivery
+# code the exchange REJECTS on a derivatives order, so a long F&O entry whose
+# schedule pinned no product silently died at the broker. Derivatives default
+# to NRML carry (matching the short side's ``short_products[0]``); the cash
+# segments keep CNC explicitly. Conditional splat — an older app without the
+# capability field keeps loading this connector on the old fallback.
+_DEFAULT_PRODUCTS_KWARG: dict = (
+    {"default_products": MappingProxyType({
+        "NSE_EQ": "CNC", "BSE_EQ": "CNC",
+        "NFO": "NRML", "BFO": "NRML",
+        "MCX": "NRML", "CDS": "NRML", "BCD": "NRML",
+    })}
+    if "default_products" in getattr(
+        ExecCapabilities, "__dataclass_fields__", {}
+    )
+    else {}
+)
+
+# NSE index-derivative FREEZE quantities — the maximum single-order size the
+# exchange accepts; a larger order is rejected WHOLE (S7). The app's forced
+# square-offs split a big flatten into freeze-sized child orders using this.
+# NSE revises these periodically; declaring LOWER than the real limit is
+# always exchange-legal (just more child orders), so err low when updating.
+# Stock-derivative freeze limits are per-stock files and are NOT declared —
+# undeclared underlyings simply don't split (pre-S7 behavior).
+# Keyed by BOTH the exchange root and the ALIASED underlying name the data
+# half stamps into symbol_master (``_INDEX_UNDERLYING_ALIAS`` maps NIFTY →
+# "NIFTY 50" etc. at dump time) — the square-off services pass the STORED
+# form, so a root-only map would never match and the split would silently
+# never fire (caught in review; a cross-half test now pins the pairing).
+_FREEZE_QTY_KWARG: dict = (
+    {"freeze_qty_by_underlying": MappingProxyType({
+        "NIFTY": 1800, "NIFTY 50": 1800,
+        "BANKNIFTY": 900, "NIFTY BANK": 900,
+        "FINNIFTY": 1800, "NIFTY FIN SERVICE": 1800,
+        "MIDCPNIFTY": 4200, "NIFTY MID SELECT": 4200,
+        "NIFTYNXT50": 600, "NIFTY NEXT 50": 600,
+        "SENSEX": 1000,
+    })}
+    if "freeze_qty_by_underlying" in getattr(
+        ExecCapabilities, "__dataclass_fields__", {}
+    )
+    else {}
+)
+
 # Zerodha auto-squares-off every open ``MIS`` position near the session close
 # (~15:20 IST); ``CNC`` (delivery) and ``NRML`` (F&O carry) are held overnight.
 # WHICH product codes mean "intraday" is broker-specific knowledge, so the app
@@ -889,6 +988,31 @@ _SHORT_PRODUCTS_KWARG: dict = (
 _INTRADAY_PRODUCTS_KWARG: dict = (
     {"intraday_product_types": ("MIS",)}
     if "intraday_product_types" in getattr(
+        ExecCapabilities, "__dataclass_fields__", {}
+    )
+    else {}
+)
+
+# Zerodha's RMS square-off CUTOFF per segment, in minutes BEFORE the session
+# close: fresh MIS/CO orders are REJECTED past it ("RMS: Auto Square Off
+# Block") and the ₹50+GST penalty square-off begins, so the app's own
+# intraday square-off must fire BEFORE ``close − cutoff``. Values are the
+# CONSERVATIVE (largest historically published) figures from Zerodha's
+# support pages — equity 15:20 on a 15:30 close (10), equity F&O 15:25 (5),
+# currency 16:45 on 17:00 (15), commodities 25 minutes before close — because
+# Zerodha shifts them later/earlier per volatility bulletins and firing early
+# is safe while firing late is a guaranteed penalty. ``MCX`` answers the agri
+# sub-sessions too via the engine's parent-key rule (MCX_AGRI / MCX_AGRI_EARLY
+# inherit 25). Same conditional splat as above — an older app without the
+# field keeps loading this connector and simply anchors to the session close.
+_INTRADAY_CUTOFF_KWARG: dict = (
+    {"intraday_squareoff_cutoff_minutes": MappingProxyType({
+        "NSE_EQ": 10, "BSE_EQ": 10,
+        "NFO": 5, "BFO": 5,
+        "CDS": 15, "BCD": 15,
+        "MCX": 25,
+    })}
+    if "intraday_squareoff_cutoff_minutes" in getattr(
         ExecCapabilities, "__dataclass_fields__", {}
     )
     else {}
@@ -957,6 +1081,13 @@ class ExecPlugin(ExecPluginV2):
         # Short Phase 0 — Zerodha's intraday (auto-square-off) product codes.
         # Same conditional splat, same reason (see ``_INTRADAY_PRODUCTS_KWARG``).
         **_INTRADAY_PRODUCTS_KWARG,
+        # S3 — per-segment RMS square-off cutoffs (minutes before close) so the
+        # app's intraday flatten provably beats Zerodha's penalty square-off.
+        **_INTRADAY_CUTOFF_KWARG,
+        # S6 — per-segment unpinned-order product defaults (F&O → NRML carry).
+        **_DEFAULT_PRODUCTS_KWARG,
+        # S7 — index-derivative freeze quantities so forced flattens split.
+        **_FREEZE_QTY_KWARG,
     )
 
     _THROTTLE_RESET_SECS: ClassVar[float] = 300.0
@@ -1092,6 +1223,13 @@ class ExecPlugin(ExecPluginV2):
         agri orders could pass router gate but be rejected by broker
         at place_order time AND winter non-agri orders slipped through
         the 23:30–23:55 gap the broker had closed.
+
+        Segment codes are first collapsed via :func:`_session_segment`,
+        so the symbol_master dump forms (``NFO-FUT``/``NFO-OPT``/
+        ``CDS-OPT``/``MCX-FUT``…) resolve to their exchange session
+        instead of falling through to the multi-venue union — pre-fix
+        that union's 23:30/23:55 latest close anchored NFO/BFO/CDS/BCD
+        square-offs hours after those markets closed.
         """
         ist = ZoneInfo("Asia/Kolkata")
         equity              = MarketWindow(dtime( 9, 15), dtime(15, 30), tz=ist)
@@ -1103,7 +1241,7 @@ class ExecPlugin(ExecPluginV2):
         )
         commodity_agri      = MarketWindow(dtime( 9,  0), dtime(21,  0), tz=ist)
         commodity_agri_early= MarketWindow(dtime( 9,  0), dtime(17,  0), tz=ist)
-        seg = (segment or "").upper()
+        seg = _session_segment(segment)
         if seg in {"CDS", "BCD", "NSE_CDS", "BSE_CDS"}:
             return (currency,)
         if seg == "MCX_AGRI":
@@ -1117,6 +1255,83 @@ class ExecPlugin(ExecPluginV2):
         # No segment hint — return the broadest union an Indian-equity
         # exec plugin reasonably covers (equity + non-agri commodities).
         return (equity, commodity_nonagri)
+
+    def session_segment_for(
+        self,
+        segment: str,
+        sector: str | None = None,
+        underlying: str | None = None,
+    ) -> str:
+        """The SESSION segment whose market hours govern an instrument.
+
+        Optional engine hook (additive — older apps simply never call it).
+        The engine passes what its symbol_master knows: the stored segment
+        code plus the row's ``sector`` / ``underlying_symbol``; which session
+        an instrument belongs to is broker/exchange knowledge that lives
+        here, never in the app.
+
+        Zerodha specifics: dump codes collapse to their exchange session
+        (``NFO-OPT`` → ``NFO``), and MCX agri commodities — which share the
+        ``MCX-FUT``/``MCX-OPT`` dump segments with non-agri — are split out
+        by sector + underlying root to ``MCX_AGRI`` (09:00–21:00) or
+        ``MCX_AGRI_EARLY`` (09:00–17:00) so a session-anchored consumer (the
+        square-off services) never times an agri flatten against the
+        23:30/23:55 non-agri close. Unknown agri roots default to the
+        EARLIER session (fail-early is the safe direction for a forced
+        close). Never raises; falls back to the collapsed segment.
+        """
+        seg = _session_segment(segment)
+        if not seg.startswith("MCX") or seg in {"MCX_AGRI", "MCX_AGRI_EARLY"}:
+            return seg
+        sector_u = (sector or "").strip().upper()
+        if sector_u != _MCX_AGRI_SECTOR:
+            return seg                      # bullion / metals / energy / index
+        root = (underlying or "").strip().upper()
+        if root in _MCX_AGRI_LATE_ROOTS:
+            return "MCX_AGRI"               # cotton complex / CPO: 21:00 close
+        return "MCX_AGRI_EARLY"             # every other/unknown agri: 17:00
+
+    def expiring_contract_close(self, segment: str) -> dtime | None:
+        """Time an EXPIRING contract stops trading on its last day, when
+        earlier than the segment session close (optional engine hook).
+
+        NSE/BSE currency derivatives cease trading at **12:30 IST** on their
+        last trading day while the CDS/BCD session itself runs to 17:00 — an
+        expiry-day square-off anchored to the session close would fire four
+        hours after the contract stopped trading. Equity F&O and MCX expire
+        at their session close, so everything else answers ``None``.
+        """
+        seg = _session_segment(segment)
+        if seg in {"CDS", "BCD", "NSE_CDS", "BSE_CDS"}:
+            return dtime(12, 30)
+        return None
+
+    def expiry_close_advance_days(
+        self,
+        segment: str,
+        sector: str | None = None,
+        underlying: str | None = None,
+    ) -> int:
+        """CALENDAR days before expiry by which a carry position must already
+        be flat (optional engine hook).
+
+        MCX runs a staggered-delivery TENDER period ahead of expiry for its
+        physically-settled commodities (bullion, base metals, agri), and
+        Zerodha force-closes client positions **one day before the tender
+        period starts** — e.g. an Apr-4 expiry tenders from ~Mar-28 and is
+        closed by Mar-27, EIGHT calendar days before expiry. An expiry-day
+        flatten is a week too late there, so those sectors declare a
+        conservative 8-day advance (early is a shorter hold; late is a
+        delivery obligation). Cash-settled MCX energy (crude, natural gas)
+        and everything non-MCX settle at expiry and stay 0.
+        """
+        seg = _session_segment(segment)
+        if not seg.startswith("MCX"):
+            return 0
+        sector_u = (sector or "").strip().upper()
+        if sector_u in {"BULLION", "BASE METALS", _MCX_AGRI_SECTOR}:
+            return 8
+        return 0
 
     def calculate_fees(self, trade: TradeFill) -> Fees:
         """Delegate to the inlined India fee schedule."""
@@ -1134,8 +1349,32 @@ class ExecPlugin(ExecPluginV2):
             return early
 
         kite = self._session.kite_exec
-        order_type = ORDER_TYPE_MAP.get(request.order_type, "MARKET")
-        product = PRODUCT_MAP.get(request.product, "CNC")
+        # STRICT order-type mapping (review): an unknown code used to fall
+        # back to MARKET — turning a mistyped stop ("SL", "STOP_MARKET") into
+        # an immediate unprotected market fill. All four core app codes are
+        # mapped, so nothing legitimate is lost by rejecting the rest.
+        order_type = ORDER_TYPE_MAP.get((request.order_type or "").strip().upper())
+        if order_type is None:
+            return OrderResponse(
+                ok=False,
+                error=(
+                    f"unknown order type {request.order_type!r} for Zerodha — "
+                    f"expected one of {sorted(ORDER_TYPE_MAP)}"
+                ),
+            )
+        # STRICT product mapping (S6): an unknown code used to silently fall
+        # back to "CNC", which turns e.g. an NRML F&O exit into a
+        # broker-rejected delivery order — reject loudly instead so the
+        # caller sees exactly what went wrong.
+        product = PRODUCT_MAP.get((request.product or "").strip().upper())
+        if product is None:
+            return OrderResponse(
+                ok=False,
+                error=(
+                    f"unknown product {request.product!r} for Zerodha — "
+                    f"expected one of {sorted(PRODUCT_MAP)}"
+                ),
+            )
         exchange = request.exchange or "NSE"
 
         params: dict = {
@@ -1147,13 +1386,15 @@ class ExecPlugin(ExecPluginV2):
             "order_type": order_type,
             "product": product,
             "validity": "DAY",
-            "price": request.price if order_type in ("LIMIT", "STOP_LIMIT") else None,
+            # Kite param routing: SL (stop-limit) carries price + trigger;
+            # SL-M (stop-market) carries trigger only; LIMIT carries price.
+            "price": request.price if order_type in ("LIMIT", "SL") else None,
             "trigger_price": (
-                request.trigger_price if order_type in ("STOP_LIMIT", "STOP") else None
+                request.trigger_price if order_type in ("SL", "SL-M") else None
             ),
             "tag": request.client_order_id,
         }
-        if order_type in ("MARKET", "STOP"):
+        if order_type in ("MARKET", "SL-M"):
             params["market_protection"] = -1
 
         try:
@@ -1204,7 +1445,15 @@ class ExecPlugin(ExecPluginV2):
                 quantity=changes.quantity,
                 price=changes.price,
                 trigger_price=changes.trigger_price,
-                order_type=changes.order_type,
+                # App taxonomy → Kite codes (STOP_LIMIT→SL, STOP→SL-M), same
+                # one-way mapping as place_order; None passes through.
+                order_type=(
+                    ORDER_TYPE_MAP.get(
+                        (changes.order_type or "").strip().upper(),
+                        changes.order_type,
+                    )
+                    if changes.order_type is not None else None
+                ),
             )
         except Exception as exc:
             self._record_proxy_failure(exc)
@@ -1363,7 +1612,11 @@ class ExecPlugin(ExecPluginV2):
                 side=o["transaction_type"],
                 quantity=int(o["quantity"]),
                 filled_quantity=int(o.get("filled_quantity", 0)),
-                order_type=o["order_type"],
+                # Kite SL / SL-M → the app's STOP_LIMIT / STOP taxonomy
+                # (unknown broker codes pass through verbatim).
+                order_type=_ORDER_TYPE_REVERSE.get(
+                    o["order_type"], o["order_type"],
+                ),
                 product=o["product"],
                 status=status,
                 price=float(o["price"]) if o.get("price") else None,
@@ -1407,11 +1660,17 @@ class ExecPlugin(ExecPluginV2):
             self._log_query_failure("holdings", exc)
             return []
         self._reset_error_throttle("holdings")
+        # ``quantity`` alone under-reports a freshly-settling stock: Kite
+        # splits a holding into ``quantity`` (settled, in demat) +
+        # ``t1_quantity`` (bought T-1, awaiting settlement) — the SELLABLE
+        # size is their SUM (Zerodha allows selling T1 stock). Reporting only
+        # the settled part would make the engine's exit-size resolution
+        # under-flatten a position bought yesterday.
         return [
             Holding(
                 symbol=h["tradingsymbol"],
                 exchange=h["exchange"],
-                quantity=int(h["quantity"]),
+                quantity=int(h["quantity"]) + int(h.get("t1_quantity", 0) or 0),
                 average_price=float(h["average_price"]),
                 last_price=float(h["last_price"]),
                 pnl=float(h.get("pnl", 0.0)),
