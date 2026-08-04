@@ -339,7 +339,7 @@ class BinanceSession:
         delays = self._SIGNED_PROXY_RETRY_DELAYS
         for attempt in range(len(delays) + 1):
             try:
-                with self._signed_call_proxy(), self.api_lock:
+                with self.api_lock, self._signed_call_proxy():
                     self._client.get_account()
                 self._authenticated = True
                 logger.info("BinanceSession[%s] authenticated", self.alias)
@@ -373,6 +373,15 @@ class BinanceSession:
         plugin). No-op when no proxy is configured (signed call
         runs direct — broker rejects it if IP allowlist requires
         the tunnel, surfacing the misconfig clearly).
+
+        ENTER THIS INSIDE ``api_lock``, never outside it — always
+        ``with self.api_lock, self._signed_call_proxy():``. The scope
+        mutates ``client.session.proxies``, which is SHARED state; entering
+        it first and then blocking on the lock leaves a window in which a
+        concurrent PUBLIC call (``get_klines`` backfill) already holding the
+        lock egresses through the tunnel. That is exactly what
+        F-S2-bin-public-direct exists to prevent — see this module's
+        ``apply_persistent_proxy`` docstring on backfill saturation.
 
         W2 — the URL is resolved LIVE per call via
         :meth:`_resolve_signed_proxy`, not read from a value snapshotted

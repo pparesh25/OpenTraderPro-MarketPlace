@@ -312,7 +312,7 @@ class BinanceSession:
         delays = self._SIGNED_PROXY_RETRY_DELAYS
         for attempt in range(len(delays) + 1):
             try:
-                with self._signed_call_proxy(), self.api_lock:
+                with self.api_lock, self._signed_call_proxy():
                     self._client.get_account()
                 self._authenticated = True
                 logger.info("BinanceSession[%s] authenticated", self.alias)
@@ -2052,7 +2052,7 @@ class ExecPlugin(ExecPluginV2):
             method_name = _METHODS[segment]["open_orders"]
             try:
                 # F-S2-bin-public-direct — signed call routed through tunnel.
-                with self._session._signed_call_proxy(), self._session.api_lock:
+                with self._session.api_lock, self._session._signed_call_proxy():
                     rows = getattr(client, method_name)() or []
             except Exception as exc:
                 # A single segment being unavailable shouldn't abort
@@ -2095,7 +2095,7 @@ class ExecPlugin(ExecPluginV2):
             method_name = _METHODS[segment]["open_orders"]
             try:
                 # F-S2-bin-public-direct — signed call routed through tunnel.
-                with self._session._signed_call_proxy(), self._session.api_lock:
+                with self._session.api_lock, self._session._signed_call_proxy():
                     orders = getattr(client, method_name)() or []
             except Exception as exc:
                 msg = str(exc)
@@ -2132,7 +2132,7 @@ class ExecPlugin(ExecPluginV2):
         # field on the exchange — it's local-only, and best effort).
         try:
             # F-S2-bin-public-direct — signed call routed through tunnel.
-            with self._session._signed_call_proxy(), self._session.api_lock:
+            with self._session.api_lock, self._session._signed_call_proxy():
                 account = client.get_account() or {}
         except Exception as exc:
             logger.warning("Binance[%s] spot account: %s", self.alias, exc)
@@ -2168,7 +2168,7 @@ class ExecPlugin(ExecPluginV2):
                 continue
             try:
                 # F-S2-bin-public-direct — signed call routed through tunnel.
-                with self._session._signed_call_proxy(), self._session.api_lock:
+                with self._session.api_lock, self._session._signed_call_proxy():
                     rows = getattr(client, method_name)() or []
             except Exception as exc:
                 # Detect the read-only-key signature and stop polling
@@ -2228,7 +2228,7 @@ class ExecPlugin(ExecPluginV2):
         if denied is None or USDM not in denied:
             try:
                 # F-S2-bin-public-direct — signed call routed through tunnel.
-                with self._session._signed_call_proxy(), self._session.api_lock:
+                with self._session.api_lock, self._session._signed_call_proxy():
                     acct = client.futures_account() or {}
                 avail = _safe_float(acct.get("availableBalance", 0.0))
                 used = _safe_float(acct.get("totalInitialMargin", 0.0))
@@ -2262,7 +2262,7 @@ class ExecPlugin(ExecPluginV2):
 
         try:
             # F-S2-bin-public-direct — signed call routed through tunnel.
-            with self._session._signed_call_proxy(), self._session.api_lock:
+            with self._session.api_lock, self._session._signed_call_proxy():
                 spot = client.get_account() or {}
         except Exception as exc:
             logger.warning("Binance[%s] spot margins: %s", self.alias, exc)
