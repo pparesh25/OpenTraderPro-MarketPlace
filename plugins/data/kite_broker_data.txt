@@ -714,6 +714,15 @@ class DataPlugin(DataPluginV2):
         self._subscribed_tokens: list[int] = []
         self._pending_tokens: list[int] = []
         self._ws_connected: bool = False
+        # W1 reconnect recovery — ``_pending_tokens`` is a one-shot queue that
+        # ``_flush_pending_tokens`` drains and clears, so it is EMPTY by the
+        # time KiteTicker auto-reconnects. ``_subscribed_tokens`` is the true
+        # live set and is what ``_on_ws_connect`` re-flushes from. The
+        # has-connected flag distinguishes the first connect (no resume event)
+        # from every later one; the disconnect stamp measures the gap the app
+        # must gap-backfill.
+        self._ws_has_connected: bool = False
+        self._ws_disconnected_at: float | None = None
         self._tokens_lock = threading.Lock()
         self._last_cum_volume: dict[int, int] = {}
 
@@ -1112,10 +1121,49 @@ class DataPlugin(DataPluginV2):
 
     # ── WebSocket lifecycle ──────────────────────────────────────────
     def _on_ws_connect(self, _ws, _response) -> None:
-        """Flush pending token queue — runs on the KiteTicker thread."""
+        """Re-attach the live token set, then announce a resume.
+
+        Runs on the KiteTicker thread, on the FIRST connect and on every
+        auto-reconnect alike.
+
+        W1 — pre-fix this only flipped the connected flag and drained
+        ``_pending_tokens``, which ``_flush_pending_tokens`` had already
+        cleared on the first connect. A reconnect therefore re-subscribed
+        ZERO tokens and the feed stayed silent until the app was restarted.
+        Refilling from ``_subscribed_tokens`` (the set kept in step with
+        subscribe/unsubscribe) makes the new socket carry everything the old
+        one did.
+
+        ``_emit_connection_resumed`` fires AFTER the flush and only on a
+        RE-connect, per the ``DataPluginV2.connection_resumed`` contract
+        ("after a new connection is established AND subscriptions have been
+        re-attached"). It is called outside ``_tokens_lock`` because it
+        publishes onto the app's event bus.
+        """
         with self._tokens_lock:
             self._ws_connected = True
+            is_reconnect = self._ws_has_connected
+            self._ws_has_connected = True
+            # Re-queue everything still subscribed that isn't already pending;
+            # ``_flush_pending_tokens`` de-dupes again before it subscribes.
+            pending = set(self._pending_tokens)
+            self._pending_tokens.extend(
+                t for t in self._subscribed_tokens if t not in pending
+            )
+            idle_seconds = (
+                time.monotonic() - self._ws_disconnected_at
+                if self._ws_disconnected_at is not None
+                else 0.0
+            )
+            self._ws_disconnected_at = None
         self._flush_pending_tokens()
+        if is_reconnect:
+            logger.info(
+                "KiteTicker[%s] reconnected after %.1fs — re-subscribed %d "
+                "token(s).", self.alias, idle_seconds,
+                len(self._subscribed_tokens),
+            )
+            self._emit_connection_resumed(idle_seconds)
 
     def _flush_pending_tokens(self) -> None:
         """Drain ``_pending_tokens`` onto the ticker under the lock."""
@@ -1143,6 +1191,11 @@ class DataPlugin(DataPluginV2):
     def _on_ws_close(self, _ws, code, reason) -> None:
         with self._tokens_lock:
             self._ws_connected = False
+            # W1 — start the clock the matching ``_on_ws_connect`` reports as
+            # ``idle_seconds``. Monotonic: this measures a duration, so it must
+            # not move when the wall clock does.
+            if self._ws_disconnected_at is None:
+                self._ws_disconnected_at = time.monotonic()
         logger.info(
             "KiteTicker[%s] closed: %s %s", self.alias, code, reason,
         )
