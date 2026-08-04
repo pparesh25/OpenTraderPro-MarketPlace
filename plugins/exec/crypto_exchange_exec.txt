@@ -186,6 +186,14 @@ class BinanceSession:
     configured client + exchange-info cache per alias.
     """
 
+    # W2 — backoff between auth retries when the signed call fails on a
+    # TRANSPORT error. Sized to cover a normal ``ssh -D`` handshake
+    # (~0.5-3 s): 4 attempts, ~3.5 s worst case. Auth runs on a worker
+    # thread in both roots (AuthWorker's QThread in the GUI, the daemon's
+    # login thread headless), never the Qt main thread, so this cannot
+    # freeze the UI.
+    _SIGNED_PROXY_RETRY_DELAYS: ClassVar[tuple[float, ...]] = (0.5, 1.0, 2.0)
+
     def __init__(self, alias: str) -> None:
         self.alias = alias
         self._api_key: str = ""
@@ -294,24 +302,39 @@ class BinanceSession:
 
         F-S2-bin-public-direct — wrapped in ``_signed_call_proxy``;
         see data plugin's matching docstring + module-level rationale.
+
+        W2 — transport failures are retried with backoff (the SOCKS
+        tunnel can still be handshaking at first login); a
+        ``BinanceAPIException`` is not. Same rationale as the data half.
         """
         if self._client is None:
             return False, "Not configured"
-        try:
-            with self._signed_call_proxy(), self.api_lock:
-                self._client.get_account()
-            self._authenticated = True
-            logger.info("BinanceSession[%s] authenticated", self.alias)
-            return True, "Authenticated with Binance."
-        except BinanceAPIException as exc:
-            msg = getattr(exc, "message", str(exc))
-            logger.error("BinanceSession[%s] auth failed: %s", self.alias, msg)
-            return False, f"Auth failed: {msg}"
-        except Exception as exc:
-            logger.error(
-                "BinanceSession[%s] auth error: %s", self.alias, exc,
-            )
-            return False, f"Auth error: {exc}"
+        delays = self._SIGNED_PROXY_RETRY_DELAYS
+        for attempt in range(len(delays) + 1):
+            try:
+                with self._signed_call_proxy(), self.api_lock:
+                    self._client.get_account()
+                self._authenticated = True
+                logger.info("BinanceSession[%s] authenticated", self.alias)
+                return True, "Authenticated with Binance."
+            except BinanceAPIException as exc:
+                msg = getattr(exc, "message", str(exc))
+                logger.error("BinanceSession[%s] auth failed: %s", self.alias, msg)
+                return False, f"Auth failed: {msg}"
+            except Exception as exc:
+                if attempt >= len(delays) or not self._is_transient_proxy_error(exc):
+                    logger.error(
+                        "BinanceSession[%s] auth error: %s", self.alias, exc,
+                    )
+                    return False, f"Auth error: {exc}"
+                logger.warning(
+                    "BinanceSession[%s] auth attempt %d hit a transport error "
+                    "(%s) — the SOCKS tunnel is likely still handshaking; "
+                    "retrying in %.1fs.",
+                    self.alias, attempt + 1, exc, delays[attempt],
+                )
+                time.sleep(delays[attempt])
+        return False, "Auth error: proxy retries exhausted"
 
     # ── Exchange info cache ──────────────────────────────────────────
     def load_symbols(self, segment: str = SPOT, force: bool = False) -> None:
@@ -434,8 +457,10 @@ class BinanceSession:
             )
 
     # ── Persistent proxy (F-S2-bin-proxy) ────────────────────────────
-    def apply_persistent_proxy(self, proxy_url: str | None) -> None:
-        """Store the proxy URL for SIGNED REST calls only.
+    def apply_persistent_proxy(
+        self, proxy_url: str | Callable[[], str | None] | None,
+    ) -> None:
+        """Store the signed-REST proxy — preferably as a live RESOLVER.
 
         F-S2-bin-public-direct — was: mutated ``client.session.proxies``
         globally so EVERY REST call routed through the tunnel including
@@ -444,30 +469,94 @@ class BinanceSession:
         :meth:`_signed_call_proxy`. See data plugin's matching docstring
         for the full rationale (backfill saturation, Qt main thread
         freezes during ~860 paginated klines fetches).
+
+        W2 — accepts a zero-arg callable and prefers it; see the data
+        half's docstring and :meth:`_resolve_signed_proxy`.
         """
-        if proxy_url and proxy_url.startswith("socks5://"):
-            proxy_url = proxy_url.replace("socks5://", "socks5h://", 1)
-        self._signed_proxy_url = proxy_url or None
-        if proxy_url:
+        if callable(proxy_url):
+            self._signed_proxy_resolver = proxy_url
+            self._signed_proxy_url = None
+            logger.info(
+                "BinanceSession[%s] signed-call proxy: live resolver "
+                "(public REST + WebSocket stay direct)", self.alias,
+            )
+            return
+        self._signed_proxy_resolver = None
+        self._signed_proxy_url = self._normalise_proxy_url(proxy_url)
+        if self._signed_proxy_url:
             logger.info(
                 "BinanceSession[%s] signed-call proxy: %s "
                 "(public REST + WebSocket stay direct)",
-                self.alias, proxy_url,
+                self.alias, self._signed_proxy_url,
             )
         else:
             logger.info(
                 "BinanceSession[%s] signed-call proxy cleared.", self.alias,
             )
 
+    @staticmethod
+    def _normalise_proxy_url(url: str | None) -> str | None:
+        """Normalise ``socks5://`` to ``socks5h://`` so DNS resolves at the
+        proxy side — otherwise ``requests`` resolves locally and may connect
+        to a different IP than the proxy's own resolver behind split DNS.
+
+        W2 — runs on every resolve now, not once at store time, so a URL
+        arriving later from a live resolver gets the same treatment.
+        """
+        if url and url.startswith("socks5://"):
+            url = url.replace("socks5://", "socks5h://", 1)
+        return url or None
+
+    def _resolve_signed_proxy(self) -> str | None:
+        """Resolve the signed-call proxy URL LIVE, on every call.
+
+        W2 — see the data half's docstring for the full rationale: a URL
+        snapshotted at ``configure()`` samples tunnel state at BOOT and
+        never updates, so a tunnel started later is never used and one torn
+        down later never fails open.
+        """
+        resolver = getattr(self, "_signed_proxy_resolver", None)
+        if resolver is None:
+            return getattr(self, "_signed_proxy_url", None)
+        try:
+            return self._normalise_proxy_url(resolver())
+        except Exception as exc:
+            logger.warning(
+                "BinanceSession[%s] signed-call proxy resolver failed (%s) "
+                "— this call runs direct.", self.alias, exc,
+            )
+            return None
+
+    @staticmethod
+    def _is_transient_proxy_error(exc: BaseException) -> bool:
+        """True for a transport failure that a moment's wait may cure.
+
+        W2 — matches PySocks / requests / urllib3 transport failures (the
+        first-login ``Connection closed unexpectedly`` signature) so auth
+        can retry them. See the data half's docstring.
+        """
+        if type(exc).__module__.split(".")[0] in {"socks", "requests", "urllib3"}:
+            return True
+        text = str(exc).lower()
+        return any(marker in text for marker in (
+            "connection closed unexpectedly", "socks", "proxy",
+            "connection refused", "connection reset", "connection aborted",
+        ))
+
     @property
     def proxy_url(self) -> str | None:
-        return getattr(self, "_signed_proxy_url", None)
+        """Signed-call proxy URL, resolved LIVE (see
+        :meth:`_resolve_signed_proxy`)."""
+        return self._resolve_signed_proxy()
 
     @contextmanager
     def _signed_call_proxy(self) -> Iterator[None]:
         """F-S2-bin-public-direct — same shape as
-        :func:`_proxy_scope` but reads URL from session state."""
-        url = getattr(self, "_signed_proxy_url", None)
+        :func:`_proxy_scope` but reads URL from session state.
+
+        W2 — resolved LIVE per call via :meth:`_resolve_signed_proxy`.
+        """
+        url = self._resolve_signed_proxy()
         if not url or self._client is None:
             yield
             return
@@ -1583,15 +1672,21 @@ class ExecPlugin(ExecPluginV2):
         # runs first wins, the other is a no-op. Per-call _proxy_scope
         # on order methods still works correctly because session-level
         # proxy and per-call proxy compose to the same routed path.
-        proxy_url = (
-            getattr(getattr(routing, "routed", None), "proxy_url", None)
-            if routing is not None else None
+        #
+        # W2 — hand the session a live RESOLVER, not a resolved string; see
+        # the data plugin's matching block for the full rationale (configure
+        # runs at boot, so a snapshot samples tunnel state at its least
+        # meaningful moment and then never updates).
+        routed = getattr(routing, "routed", None) if routing is not None else None
+        resolver = (
+            (lambda: getattr(routed, "proxy_url", None))
+            if routed is not None else None
         )
         # ``getattr`` shield: see data plugin's matching block.
         applier = getattr(self._session, "apply_persistent_proxy", None)
         if callable(applier):
-            applier(proxy_url)
-        elif proxy_url:
+            applier(resolver)
+        elif resolver is not None and resolver():
             logger.warning(
                 "BinanceSession[%s] missing apply_persistent_proxy — "
                 "exec plugin can't route signed REST through the SOCKS5 "
