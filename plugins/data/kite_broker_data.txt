@@ -1078,7 +1078,17 @@ class DataPlugin(DataPluginV2):
 
         with self._tokens_lock:
             self._pending_tokens.extend(tokens)
-            self._subscribed_tokens.extend(tokens)
+            # Dedupe on extend. ``_subscribed_tokens`` is the reconnect refill
+            # source, and ``unsubscribe_realtime`` below removes only ONE
+            # occurrence per token — so a duplicate admitted here survives an
+            # unsubscribe and gets re-subscribed by the next ``_on_ws_connect``,
+            # resurrecting a symbol the user removed as orphan ticks. Replays
+            # (reconnect push, stale self-heal) call this method repeatedly
+            # with the same tokens, so duplicates are the normal case.
+            self._subscribed_tokens.extend(
+                t for t in dict.fromkeys(tokens)
+                if t not in self._subscribed_tokens
+            )
 
         if self._ticker is None:
             self._ticker = self._session.create_ticker()
