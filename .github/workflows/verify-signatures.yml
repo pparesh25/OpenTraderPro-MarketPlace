@@ -100,3 +100,42 @@ jobs:
 
       - name: Verify all .txt signatures
         run: python .github/scripts/verify_signatures.py
+
+  # Regression pin for the line-ending defect fixed by `.gitattributes`
+  # on 2026-08-05. Signatures are over raw bytes, so git's Windows
+  # default (`core.autocrlf=true`) rewriting LF to CRLF on checkout
+  # invalidated all 33 of them — a Windows user cloning normally saw
+  # every plugin, strategy and indicator rejected as tampered. The job
+  # above could never have caught it: `ubuntu-latest` does no such
+  # translation, so the repo looked healthy from CI while being broken
+  # for an entire platform.
+  #
+  # `core.autocrlf` is set EXPLICITLY rather than trusting the runner
+  # image's default. What this leg has to reproduce is the setting a
+  # real Windows user has, and a GitHub image default is neither that
+  # nor stable across image updates — inheriting it would let the pin
+  # silently stop testing anything.
+  verify-windows:
+    name: Verify .txt signatures (Windows, core.autocrlf=true)
+    runs-on: windows-latest
+    steps:
+      - name: Reproduce git's Windows default line-ending translation
+        run: git config --global core.autocrlf true
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: '3.13'
+
+      - name: Install cryptography
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'cryptography>=42.0'
+
+      # Fails loudly if a future change drops or weakens `.gitattributes`:
+      # without it this step reports "0 verified, 33 failed".
+      - name: Verify all .txt signatures
+        run: python .github/scripts/verify_signatures.py

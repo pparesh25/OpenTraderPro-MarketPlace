@@ -1,0 +1,60 @@
+# Line-ending policy for a repository whose contents are SIGNED.
+#
+# Every `.txt` here has a detached Ed25519 signature in its `.txt.sig`
+# sibling, taken over the file's raw bytes (v1 signs
+# `filename + "\n" + content`). End-of-line translation changes those
+# bytes, so ANY translation invalidates every signature in the repo.
+#
+# Without this file that is not hypothetical: git's Windows default is
+# `core.autocrlf=true`, so a plain
+#
+#     git clone https://github.com/pparesh25/OpenTraderPro-MarketPlace
+#
+# on Windows rewrites LF to CRLF on checkout and all 33 files then fail
+# verification — the app reports them as TAMPERED, which reads as an
+# attack rather than as a checkout setting. Measured on a Windows box
+# 2026-08-05: 0 of 33 verified from a default clone, 33 of 33 from
+# `git -c core.autocrlf=false clone`. CI never caught it because the
+# workflow runs on `ubuntu-latest`, where the default does nothing.
+
+# Default for the repository: normalise text in the object store and
+# check it out with LF everywhere. Nothing matched by this line is
+# signed, so this is ordinary cross-platform hygiene.
+*               text=auto eol=lf
+
+# Signed material — exempt from the line above, and from translation in
+# BOTH directions.
+#
+# `-text` is deliberate rather than `eol=lf`. `eol=lf` would fix the
+# checkout side while leaving git's checkin-side normalisation in the
+# path, which is the same defect pointing the other way: a maintainer
+# who signs a working-tree file that happens to carry CRLF would have
+# git silently store LF, and the signature they just published would be
+# invalid for everyone — including their own next clone. `-text` means
+# the bytes in the working tree are exactly the bytes in the object
+# store, which is the property a signature over raw bytes needs.
+#
+# `-eol` is not redundant next to `-text`. The `*` line above sets
+# `eol=lf`, and git documents `eol` as "effectively setting the text
+# attribute" — so leaving it inherited makes byte-fidelity here depend
+# on git's internal precedence between two attributes that are saying
+# opposite things. Measured on git 2.x, `-text` does win (a CRLF `.txt`
+# stages with its CRLF intact either way), but that is an
+# implementation detail to observe, not one to build signature
+# integrity on. Unsetting `eol` says what this line means, and makes
+# `git check-attr eol -- <file>` report it honestly instead of
+# answering "lf" for a file nothing is allowed to translate.
+#
+# `diff` is set back on because `-text` otherwise makes git treat these
+# as binary and stop showing diffs. The marketplace's first promise is
+# that every shipped file is readable, reviewable source (README
+# §"Source-readable is the primary defence"), and that has to hold in
+# `git diff` and in PR review, not just in an editor.
+*.txt           -text -eol diff
+*.sig           -text -eol diff
+
+# Tracked compiled artefacts (`tests/__pycache__/*.pyc`, committed
+# before .gitignore covered them). `text=auto` above would almost
+# certainly detect these as binary on its own; saying so explicitly
+# means correctness here does not rest on a heuristic.
+*.pyc           binary

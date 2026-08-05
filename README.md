@@ -127,7 +127,7 @@ cd OpenTraderPro-MarketPlace
 # Verify signatures locally before copying — see SECURITY.md
 pip install cryptography
 python .github/scripts/verify_signatures.py
-# Expected: "28 verified, 0 failed"
+# Expected: "33 verified, 0 failed"
 
 # Then copy whatever you want into the marketplace_cache:
 cp plugins/data/kite_broker_data.txt   ~/.opentrader-pro/marketplace_cache/plugins/data/
@@ -143,6 +143,19 @@ cp indicators/averages/vwap.txt.sig    ~/.opentrader-pro/marketplace_cache/indic
 ```
 
 **Always copy the `.sig` sibling alongside the `.txt`.** Without the signature the file refuses to load from the marketplace cache. (User-edit dirs accept unsigned files in Developer Mode.)
+
+### Line endings — why this repository pins LF
+
+Signatures are taken over each file's **raw bytes**, so anything that rewrites those bytes invalidates them, including an end-of-line conversion. Git's default on Windows is `core.autocrlf=true`, which rewrites LF to CRLF on checkout — and until the `.gitattributes` in this repository existed, a normal `git clone` on Windows produced a working tree where **all 33 signatures failed** and the app reported every plugin, strategy and indicator as *tampered*. Nothing was tampered with; the checkout had rewritten the files.
+
+`.gitattributes` now marks the signed material `-text -eol`, so git copies those bytes verbatim in both directions and an ordinary clone verifies on every platform. **You do not need to do anything special** — `git clone` is enough.
+
+Two things worth knowing anyway:
+
+- If you are on a clone taken **before** this fix landed, re-clone it (or run `git rm --cached -r . && git reset --hard`) — the old working tree still holds the rewritten bytes.
+- If verification fails on *every* file at once, suspect the checkout, not the signatures. `python .github/scripts/verify_signatures.py` will say `0 verified, 33 failed`; a re-clone with `git -c core.autocrlf=false clone …` is the quickest way to confirm that is all it was.
+
+A failure on only *some* files is a different story and does mean those files and their signatures disagree — read [SECURITY.md](SECURITY.md).
 
 ---
 
