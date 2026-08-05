@@ -1,0 +1,19 @@
+# Every .txt in this repository is a signed plugin / indicator / strategy
+# payload, and every .sig beside it is an Ed25519 signature over the RAW
+# BYTES of that file.
+#
+# Git's default end-of-line handling silently breaks that. With
+# core.autocrlf=true — the DEFAULT on Windows — checkout rewrites every LF
+# to CRLF, so the bytes on disk are no longer the bytes that were signed and
+# every signature fails to verify. Measured 2026-08-05: a stock Windows
+# clone made OpenTrader-Pro's install_from_path reject all 33 payloads as
+# `invalid_signature` and install NOTHING, i.e. the marketplace was entirely
+# unusable on Windows, with no error that pointed at line endings.
+#
+# `-text` (rather than `binary`, which is `-text -diff`) disables EOL
+# conversion in both directions while keeping diffs readable in review.
+#
+# The committed blobs are already LF, so this changes no content and needs
+# NO re-signing — it only stops checkout from corrupting what is already
+# correct in the object store.
+* -text
