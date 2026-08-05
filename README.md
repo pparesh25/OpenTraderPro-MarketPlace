@@ -127,7 +127,7 @@ cd OpenTraderPro-MarketPlace
 # Verify signatures locally before copying — see SECURITY.md
 pip install cryptography
 python .github/scripts/verify_signatures.py
-# Expected: "28 verified, 0 failed"
+# Expected: "33 verified, 0 failed"
 
 # Then copy whatever you want into the marketplace_cache:
 cp plugins/data/kite_broker_data.txt   ~/.opentrader-pro/marketplace_cache/plugins/data/
@@ -143,6 +143,19 @@ cp indicators/averages/vwap.txt.sig    ~/.opentrader-pro/marketplace_cache/indic
 ```
 
 **Always copy the `.sig` sibling alongside the `.txt`.** Without the signature the file refuses to load from the marketplace cache. (User-edit dirs accept unsigned files in Developer Mode.)
+
+### Line endings — why this repository ships `.gitattributes`
+
+Signatures are taken over each file's **raw bytes**, so anything that rewrites those bytes invalidates them — including an end-of-line conversion. Git's default on Windows is `core.autocrlf=true`, which rewrites LF to CRLF on checkout, and until `.gitattributes` existed a normal `git clone` on Windows produced a working tree where **all 33 signatures failed**. The app reported every plugin, strategy and indicator as *tampered* and installed nothing. Nothing had been tampered with; the checkout had rewritten the files.
+
+`.gitattributes` now marks the tree `-text`, so git copies those bytes verbatim in both directions. **You do not need to do anything special** — `git clone` is enough, on any platform.
+
+Two things worth knowing anyway:
+
+- If you are on a clone taken **before** this landed, re-clone it — the old working tree still holds the rewritten bytes.
+- If verification fails on *every* file at once, suspect the checkout rather than the signatures: `verify_signatures.py` will say `0 verified, 33 failed`, and re-cloning is the quickest way to confirm that is all it was.
+
+A failure on only *some* files is a different story, and does mean those files and their signatures disagree — read [SECURITY.md](SECURITY.md).
 
 ---
 
