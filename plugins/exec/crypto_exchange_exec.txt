@@ -1491,6 +1491,26 @@ class ExecPlugin(ExecPluginV2):
             "STOP", "STOP_MARKET",
             "TAKE_PROFIT_MARKET",                      # FUTURES
         }),
+        # S4 — Binance is a fractional venue and this plugin has always
+        # been able to act like one: `place_order` rounds every quantity
+        # through `BinanceSession.round_quantity`, which reads the symbol's
+        # real LOT_SIZE / MARKET_LOT_SIZE `stepSize` filter. What was
+        # missing was the DECLARATION, and the default is False — so the
+        # app treated Binance as a whole-share venue: the Quick Order spin
+        # box refused fractional input, a paper-wrapped Binance account
+        # (which inherits these caps) rejected fractional orders outright,
+        # and PositionSizer floored sizing to whole coins whenever the
+        # per-symbol step cache missed. A $1,000 budget on BTC then sized
+        # to 0 and placed nothing.
+        supports_fractional_quantity=True,
+        # Plugin-wide FALLBACK only — tier 1 is the per-symbol step from
+        # `SymbolStepCache` (F-S6-G follow-up #1), and the wire-level
+        # authority is `round_quantity` above, which re-aligns to the real
+        # per-symbol filter before the API call. 1e-8 is Binance's finest
+        # permitted increment, so this floor never rejects a quantity the
+        # exchange would have accepted; anything coarser would silently
+        # floor legitimate sizes away (0.05 BTC → 0 at a step of 1.0).
+        default_step_size=1e-8,
         async_execution_reports=True,
         rate_limits=RateLimits(buckets=(
             RateLimit(max_units=50, window_seconds=10.0, category="orders"),
@@ -2052,7 +2072,14 @@ class ExecPlugin(ExecPluginV2):
             positions.append(Position(
                 symbol=str(b.get("asset", "")),
                 exchange=SPOT,
-                quantity=int(total) if total >= 1 else 0,
+                # S4 — the spot balance is the position. `int(total) if
+                # total >= 1 else 0` reported 61.38 AVAX as 61 and ANY
+                # sub-unit balance as 0, so a real holding of 0.4 FIL
+                # arrived as a flat position and the app closed it out.
+                # Every consumer inherits this number: the journal's
+                # `trade_positions_v2`, sandbox reconciliation, drift
+                # reports and exit sizing.
+                quantity=total,
                 average_price=0.0,
                 pnl=0.0,
                 product="SPOT",
@@ -2104,7 +2131,10 @@ class ExecPlugin(ExecPluginV2):
                 positions.append(Position(
                     symbol=str(p.get("symbol", "")),
                     exchange=segment,
-                    quantity=int(qty),
+                    # S4 — `positionAmt` is fractional on every futures
+                    # contract; int() zeroed sub-unit positions and made
+                    # them invisible to exit sizing and reconciliation.
+                    quantity=qty,
                     average_price=_safe_float(p.get("entryPrice", 0.0)),
                     pnl=_safe_float(p.get("unRealizedProfit", 0.0)),
                     product=segment,
@@ -2319,8 +2349,13 @@ def _order_to_record(o: dict, segment: str) -> OrderRecord:
         symbol=str(o.get("symbol", "")),
         exchange=segment,
         side=str(o.get("side", "")),
-        quantity=int(_safe_float(o.get("origQty", 0))),
-        filled_quantity=int(_safe_float(o.get("executedQty", 0))),
+        # S4 — the headline truncation. `executedQty` is the broker's
+        # cumulative fill; int() turned a 0.5 BTC fill into 0, and
+        # OrderTracker journals that as the order's filled_quantity. The
+        # app's column has been DOUBLE since F-S7-7 (schema v7) — the
+        # precision was being destroyed here, one layer before the DB.
+        quantity=_safe_float(o.get("origQty", 0)),
+        filled_quantity=_safe_float(o.get("executedQty", 0)),
         order_type=str(o.get("type", "")),
         product=segment,
         status=status,       # type: ignore[arg-type]
