@@ -162,6 +162,20 @@ class _TokenCaptureHandler(http.server.BaseHTTPRequestHandler):
 #   namespace="zerodha", alias=…, factory=KiteSession) so a single
 # OAuth login covers both data and exec for the same alias.
 # ══════════════════════════════════════════════════════════════════════
+def _request_token_from_url(url: str) -> str:
+    """``request_token`` out of a URL's query string, or ``""``.
+
+    Tolerates the empty string and any non-URL text so the redirect walk can
+    call it on every hop without pre-checking.
+    """
+    if not url or "request_token" not in url:
+        return ""
+    try:
+        return (parse_qs(urlparse(url).query).get("request_token") or [""])[0]
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
 class KiteSession:
     """Owns a pair of ``KiteConnect`` instances (direct + proxied) for one alias.
 
@@ -177,6 +191,10 @@ class KiteSession:
         self._api_secret: str = ""
         self._access_token: str = ""
         self._authenticated: bool = False
+        # Scripted-login credentials (headless). Empty = browser flow.
+        self._user_id: str = ""
+        self._password: str = ""
+        self._totp_seed: str = ""
         # Wall-clock when the current access token becomes invalid.
         # Kite mints daily-expiry tokens; populated at successful login.
         self._expires_at: datetime | None = None
@@ -287,12 +305,152 @@ class KiteSession:
         )
 
     # ── OAuth ────────────────────────────────────────────────────────
+    def configure_scripted_login(
+        self, user_id: str, password: str, totp_seed: str,
+    ) -> None:
+        """Install (or clear) the headless scripted-login credentials.
+
+        All three are required together — a partial set is treated as NOT
+        configured, because falling back to the browser is the honest
+        outcome for a half-filled form, and a scripted login that fails at
+        step 2 looks identical to a wrong password.
+        """
+        self._user_id = (user_id or "").strip()
+        self._password = password or ""
+        self._totp_seed = (totp_seed or "").strip()
+
+    @property
+    def can_login_scripted(self) -> bool:
+        """True iff all three scripted-login fields are present."""
+        return bool(self._user_id and self._password and self._totp_seed)
+
+    def _login_scripted(self) -> tuple[bool, str]:
+        """Zerodha's own login endpoints + TOTP, no browser.
+
+        Three hops, and the third is the subtle one:
+
+        1. ``POST /api/login``  (user_id + password)  → ``data.request_id``
+        2. ``POST /api/twofa``  (request_id + TOTP)   → session cookies
+        3. ``GET  kite.login_url()`` — with those cookies Kite Connect
+           redirects straight to the app's registered redirect URL carrying
+           ``?request_token=…``.
+
+        Step 3 walks the redirect chain with ``allow_redirects=False`` and
+        reads the token out of the ``Location`` header. Following it would
+        make ``requests`` actually connect to the redirect target — usually
+        ``127.0.0.1``, where nothing is listening on a headless box — and
+        the resulting ConnectionError would mask a login that had in fact
+        succeeded.
+
+        Secret hygiene (design §5.1): the password, the seed, the generated
+        code and the token are never logged, and broker error text is
+        reported by exception CLASS only.
+        """
+        try:
+            import requests
+        except ImportError:                                   # pragma: no cover
+            return False, "requests not installed (needed for scripted login)."
+        try:
+            from opentrader.platform.totp import current_totp
+        except ImportError:                                   # pragma: no cover
+            return False, "opentrader.platform.totp unavailable."
+
+        root = "https://kite.zerodha.com"
+        try:
+            with requests.Session() as s:
+                s.headers.update({"X-Kite-Version": "3"})
+                r1 = s.post(
+                    f"{root}/api/login",
+                    data={"user_id": self._user_id, "password": self._password},
+                    timeout=15,
+                )
+                if r1.status_code != 200:
+                    return False, (
+                        f"scripted login step 1 (password) rejected "
+                        f"[HTTP {r1.status_code}]"
+                    )
+                request_id = (r1.json().get("data") or {}).get("request_id", "")
+                if not request_id:
+                    return False, "scripted login step 1 returned no request_id."
+
+                r2 = s.post(
+                    f"{root}/api/twofa",
+                    data={
+                        "user_id": self._user_id,
+                        "request_id": request_id,
+                        "twofa_value": current_totp(self._totp_seed),
+                        "twofa_type": "totp",
+                    },
+                    timeout=15,
+                )
+                if r2.status_code != 200:
+                    return False, (
+                        f"scripted login step 2 (TOTP) rejected "
+                        f"[HTTP {r2.status_code}] — check the seed and the "
+                        f"host clock"
+                    )
+
+                # Step 3 — walk, never follow.
+                token = ""
+                url = self._kite.login_url()
+                for _ in range(10):
+                    r3 = s.get(url, allow_redirects=False, timeout=15)
+                    token = _request_token_from_url(r3.url)
+                    if token:
+                        break
+                    nxt = r3.headers.get("Location", "") if r3.is_redirect else ""
+                    if not nxt:
+                        break
+                    token = _request_token_from_url(nxt)
+                    if token:
+                        break
+                    nxt_abs = nxt if nxt.startswith("http") else root + nxt
+                    # The TERMINAL hop is the app's own registered redirect URL
+                    # (commonly 127.0.0.1), where nothing listens on a headless
+                    # box. Never fetch it: if it carried a token we already have
+                    # it above, and if it did not — a refused or cancelled
+                    # login — connecting turns a clear diagnosis into a bare
+                    # ConnectionError. Caught by the fake-Kite test's
+                    # "2FA ok but no token" row, which this loop originally
+                    # failed exactly that way.
+                    if not nxt_abs.startswith(root):
+                        break
+                    url = nxt_abs
+                if not token:
+                    return False, (
+                        "scripted login completed 2FA but no request_token "
+                        "appeared in the redirect chain."
+                    )
+            return self.login_with_token(token)
+        except Exception as exc:
+            self._authenticated = False
+            logger.error(
+                "KiteSession[%s] scripted login failed: %s",
+                self.alias, type(exc).__name__,
+            )
+            return False, f"Scripted login failed: {type(exc).__name__}"
+
     def login(self, timeout: int = 120) -> tuple[bool, str]:
-        """Browser-based OAuth login. Blocking — call from a worker thread."""
+        """Log in. SCRIPTED when the headless credentials are configured,
+        otherwise the browser OAuth flow.
+
+        The split is deliberate and one-way: if the three scripted fields
+        are present this NEVER silently opens a browser on failure. On a
+        GUI-less box that fallback cannot succeed, and pretending otherwise
+        turns a diagnosable auth error into a 120-second timeout. The real
+        fallback is the operator one — ``authenticate_with_token`` via
+        ``opentrader-daemon auth complete`` (design §5.2).
+        """
         if not KITE_AVAILABLE:
             return False, "kiteconnect not installed."
         if not self.is_configured:
             return False, "Not configured. Provide api_key + api_secret."
+
+        if self.can_login_scripted:
+            logger.info(
+                "KiteSession[%s] scripted login (headless, TOTP).", self.alias,
+            )
+            return self._login_scripted()
 
         try:
             _TokenCaptureHandler.captured_token = ""
@@ -1046,6 +1204,35 @@ class ExecPlugin(ExecPluginV2):
                 "(e.g. socks5h://127.0.0.1:8080)."
             ),
         ),
+        # ── Headless scripted login (design_headless_runtime §5.1) ──────
+        # All three OPTIONAL: leave them blank and login() keeps the
+        # browser OAuth flow exactly as before, so every existing GUI
+        # account and every already-signed deployment is unaffected.
+        # Fill all three and a GUI-less daemon can mint its own daily
+        # session — which is the ONLY thing that was missing for a
+        # headless soak (the engine side, SessionAuthService, has been
+        # wired and waiting since U8).
+        CredentialField(
+            "user_id", "Kite User ID", "text", required=False,
+            help_text=(
+                "Zerodha client ID (e.g. AB1234). Needed ONLY for headless "
+                "scripted login; blank keeps the browser flow."
+            ),
+        ),
+        CredentialField(
+            "password", "Kite Password", "password", required=False,
+            help_text=(
+                "Login password. Headless scripted login only. Stored in "
+                "the encrypted vault, never logged."
+            ),
+        ),
+        CredentialField(
+            "totp_seed", "TOTP Seed", "password", required=False,
+            help_text=(
+                "Base32 seed from Zerodha's external-TOTP setup (the string "
+                "behind the QR). Headless scripted login only; never logged."
+            ),
+        ),
     )
     CAPABILITIES: ClassVar[ExecCapabilities] = ExecCapabilities(
         # All five derivative exchanges Zerodha order-routes (NFO, BFO, MCX,
@@ -1131,6 +1318,14 @@ class ExecPlugin(ExecPluginV2):
                 else None
             )
         self._session.configure(api_key, api_secret)
+        # Headless scripted login (design_headless_runtime §5.1). Absent or
+        # partial → the session keeps the browser flow, so a GUI account that
+        # never fills these behaves exactly as before.
+        self._session.configure_scripted_login(
+            credentials.get("user_id", ""),
+            credentials.get("password", ""),
+            credentials.get("totp_seed", ""),
+        )
         self._session.configure_exec_proxy(proxy_url)
         # Wire the order-update push channel (V3 §F7). The KiteTicker the
         # data side owns will dispatch postbacks into our parser via the
